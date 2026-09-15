@@ -15,19 +15,23 @@
     "react": "18.3.1",
     "react-dom": "18.3.1",
     "react-markdown": "10.1.0",
-    "react-router-dom": "6.30.4",
+    "react-router": "7.18.3",
+    "react-router-dom": "7.18.3",
     "remark-breaks": "4.0.0",
     "remark-gfm": "4.0.1"
   },
   "devDependencies": {
-    "@types/node": "22.7.5",
+    "@types/node": "22.20.3",
     "@types/react": "18.3.31",
     "@types/react-dom": "18.3.7",
-    "@vitejs/plugin-react": "4.7.0",
+    "@vitejs/plugin-react": "5.2.0",
     "jsdom": "25.0.1",
     "openapi-typescript": "7.13.0",
     "typescript": "5.9.3",
-    "vite": "5.4.21",
-    "vitest": "2.1.9"
+    "vite": "8.2.2",
+    "vitest": "5.0.0"
+  },
+  "overrides": {
+    "js-yaml": "4.3.2"
   }
 }
