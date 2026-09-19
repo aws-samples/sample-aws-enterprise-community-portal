@@ -11,6 +11,8 @@ Tags are stored lowercase-normalized; TAGS#ALL singleton maintained on every wri
 """
 from __future__ import annotations
 
+import os
+
 from _conventions.errors import ForbiddenError, NotFoundError, ValidationError
 from _conventions.validation import require_enum, require_str
 from models import (CONTENT_TYPES, SCAN_CLEAN, SCAN_PENDING, SCAN_QUARANTINED,
@@ -288,6 +290,47 @@ class LibraryService:
         if not 1 <= limit <= 50:
             raise ValidationError("limit must be between 1 and 50.")
 
+        rows, next_cursor = self._search_rows(
+            q=q or None, fmt=fmt, source=source, topic=topic or None,
+            limit=limit, cursor=cursor)
+
+        out = []
+        for mat in rows:
+            url = None
+            if (mat.get("format") != "Link"
+                    and mat.get("s3Key")
+                    and mat.get("scanState") == SCAN_CLEAN):
+                url = self._storage.presign_get(
+                    mat["s3Key"], expires_in=LIBRARY_DOWNLOAD_URL_SECONDS)
+            out.append(self.resource_public(mat, download_url=url))
+
+        result: dict = {"items": out, "count": len(out)}
+        if next_cursor:
+            result["cursor"] = next_cursor
+        return result
+
+    def _search_rows(self, *, q, fmt, source, topic, limit,
+                     cursor) -> tuple[list[dict], str | None]:
+        """Pick the search backend.
+
+        When OPENSEARCH_ENDPOINT is set (the deployed state — the shared
+        portal-search collection is always on for members too) the query goes to
+        OpenSearch, which does the filtering/sort/pagination server-side and
+        avoids the O(N) GSI1 partition walk that made this path ~6 s at 5k+
+        resources.
+
+        When the endpoint is unset (local runs, or a stage where OpenSearch is
+        not wired) it fails soft to the original DynamoDB GSI1 walk + Python
+        predicate, so search still works — just at the old cost. The gate is the
+        endpoint variable, NOT the semantic-search feature flag: OpenSearch
+        backs the directory unconditionally, and the Content Library rides the
+        same collection.
+        """
+        if os.environ.get("OPENSEARCH_ENDPOINT"):
+            return self._repo.search_opensearch(
+                q=q, fmt=fmt, source=source, topic=topic,
+                limit=limit, cursor=cursor)
+
         needle = q.lower() if q else None
 
         def predicate(row: dict) -> bool:
@@ -305,23 +348,7 @@ class LibraryService:
                     return False
             return True
 
-        rows, next_cursor = self._repo.query_page(
-            limit=limit, cursor=cursor, predicate=predicate)
-
-        out = []
-        for mat in rows:
-            url = None
-            if (mat.get("format") != "Link"
-                    and mat.get("s3Key")
-                    and mat.get("scanState") == SCAN_CLEAN):
-                url = self._storage.presign_get(
-                    mat["s3Key"], expires_in=LIBRARY_DOWNLOAD_URL_SECONDS)
-            out.append(self.resource_public(mat, download_url=url))
-
-        result: dict = {"items": out, "count": len(out)}
-        if next_cursor:
-            result["cursor"] = next_cursor
-        return result
+        return self._repo.query_page(limit=limit, cursor=cursor, predicate=predicate)
 
     # --------------------------------------------------------------- tags
 

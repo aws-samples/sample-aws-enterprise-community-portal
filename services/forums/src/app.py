@@ -12,7 +12,7 @@ import json
 import os
 import re
 
-from _conventions.authz import Principal
+from _conventions.authz import Principal, claims_to_headers, extract_claims
 from _conventions.errors import AppError, global_handler, to_response
 from _conventions.idempotency import IdempotencyStore
 from _conventions.logger import set_correlation_id
@@ -30,7 +30,6 @@ from authz import (
     require_pin_or_accept,
 )
 from consumers import CONSUMED_EVENT_TYPES, EventConsumer
-from membership_client import MembershipClient
 from mention_client import MentionClient
 from models import (
     RATE_LIMIT_POST_PER_HOUR,
@@ -113,7 +112,7 @@ class Context:
     """Wires all components. Injected in tests."""
 
     def __init__(self, table=None, idempotency_table=None, mention_client=None,
-                 membership_client=None, events=None):
+                 events=None):
         if table is None:
             import boto3
             table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
@@ -121,7 +120,6 @@ class Context:
         idem_name = idempotency_table or os.environ.get("IDEMPOTENCY_TABLE", "")
         self.idempotency = IdempotencyStore(idem_name) if idem_name else None
         self.mentions = mention_client or MentionClient()
-        self.membership = membership_client or MembershipClient()
         self.events = events or EventPublisher()
         self.consumer = EventConsumer(self.repo, self.idempotency)
         self.sweep = SweepHandler(self.repo)
@@ -137,7 +135,7 @@ def _match(method: str, path: str):
 
 
 def _principal(event) -> Principal | None:
-    claims = (((event.get("requestContext") or {}).get("authorizer") or {}).get("claims")) or {}
+    claims = extract_claims(event)
     if not claims:
         return None
     return Principal.from_claims(claims)
@@ -188,7 +186,7 @@ def dispatch(event: dict, ctx: Context) -> dict:
             return _resp(401, {"code": "UNAUTHORIZED", "message": "Authentication required."})
         require_not_admin(principal)
         qs = event.get("queryStringParameters") or {}
-        claims = (((event.get("requestContext") or {}).get("authorizer") or {}).get("claims")) or {}
+        claims = extract_claims(event)
         return _execute(ctx, op, params, body, qs, principal, event, claims)
     except AppError as err:
         return _resp(err.status, {"code": err.code, "message": err.message,
@@ -199,15 +197,8 @@ def _execute(ctx: Context, op: str, params: dict, body: dict, qs: dict,
              principal: Principal, event: dict, claims: dict) -> dict:
     token = _bearer_token(event)
 
-    # Refresh stale JWT member_group_ids for Member operations that check
-    # group access. browseForums already does this; extend to all per-channel/post
-    # ops so mid-session group joins are respected everywhere (not just the list).
-    if principal.role == "Member" and token:
-        live_groups = ctx.membership.get_member_group_ids(token)
-        if live_groups is not None:
-            principal.member_group_ids = live_groups
-            if "COMMUNITY" not in principal.member_group_ids:
-                principal.member_group_ids = list(principal.member_group_ids) + ["COMMUNITY"]
+    # member_group_ids are provided fresh by the edge claims authorizer on every
+    # request (fresh-claims-at-the-edge), so no live membership refresh is needed.
 
     # --- Browse / Listings ---
     if op == "browseForums":
@@ -294,16 +285,8 @@ def _execute(ctx: Context, op: str, params: dict, body: dict, qs: dict,
 
 def _browse_forums(ctx: Context, principal: Principal, token: str | None = None) -> dict:
     group_ids = get_accessible_group_ids(principal)
-    # Supplement stale JWT claims with a live membership lookup from Identity.
-    # The JWT's member_group_ids are baked at login time and not updated when
-    # a user joins a group mid-session. This call fetches the current state.
-    if group_ids is not None and principal.role == "Member":
-        live_groups = ctx.membership.get_member_group_ids(token)
-        if live_groups is not None:
-            # Replace JWT-based groups with live data (source of truth)
-            group_ids = list(live_groups)
-            if "COMMUNITY" not in group_ids:
-                group_ids.append("COMMUNITY")
+    # principal.member_group_ids is fresh from the edge claims authorizer, so
+    # get_accessible_group_ids already reflects current membership.
     items = []
     if group_ids is None:
         # CL: get all non-hidden forums via scan (acceptable at community scale)
@@ -565,7 +548,8 @@ def _create_post(ctx: Context, channel_id: str, body: dict, principal: Principal
     # Mentions
     valid_mentions = []
     if validated["mentions"]:
-        valid_mentions = ctx.mentions.validate_mentions(validated["mentions"], channel["groupId"], token)
+        valid_mentions = ctx.mentions.validate_mentions(validated["mentions"], channel["groupId"], token,
+                                                        claim_headers=claims_to_headers(principal))
         for uid in valid_mentions:
             ctx.events.member_mentioned(uid, principal.user_id, _author_name(principal, claims), post_id, channel["groupId"], "post")
     # Channel followers for notification
@@ -629,7 +613,8 @@ def _create_reply(ctx: Context, post_id: str, body: dict, principal: Principal, 
     ctx.repo.increment_rate(principal.user_id, "reply")
     # Mentions
     if validated["mentions"]:
-        valid_mentions = ctx.mentions.validate_mentions(validated["mentions"], post["groupId"], token)
+        valid_mentions = ctx.mentions.validate_mentions(validated["mentions"], post["groupId"], token,
+                                                        claim_headers=claims_to_headers(principal))
         for uid in valid_mentions:
             ctx.events.member_mentioned(uid, principal.user_id, _author_name(principal, claims), post_id, post["groupId"], "reply")
     # Post followers for notification
@@ -879,7 +864,8 @@ def _mention_suggest(ctx: Context, qs: dict, principal: Principal, token: str | 
     if not q or not group_id:
         return _resp(200, {"items": [], "count": 0})
     require_group_access(principal, group_id)
-    candidates = ctx.mentions.suggest(q, group_id, token)
+    candidates = ctx.mentions.suggest(q, group_id, token,
+                                      claim_headers=claims_to_headers(principal))
     return _resp(200, {"items": candidates, "count": len(candidates)})
 
 
@@ -918,14 +904,8 @@ def _search(ctx: Context, qs: dict, principal: Principal, token: str | None = No
 
     posts = ctx.repo.batch_get_posts(list(matched_ids))
 
-    # Access-scope filter — supplement with live membership (same fix as browseForums)
+    # Access-scope filter — member_group_ids are fresh from the edge claims authorizer.
     accessible_groups = get_accessible_group_ids(principal)
-    if accessible_groups is not None and principal.role == "Member":
-        live_groups = ctx.membership.get_member_group_ids(token)
-        if live_groups is not None:
-            accessible_groups = list(live_groups)
-            if "COMMUNITY" not in accessible_groups:
-                accessible_groups.append("COMMUNITY")
     if accessible_groups is not None:
         accessible_set = set(accessible_groups)
         posts = [p for p in posts if p.get("groupId") in accessible_set]

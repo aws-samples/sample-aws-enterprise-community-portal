@@ -10,7 +10,7 @@ import json
 import os
 import re
 
-from _conventions.authz import Principal
+from _conventions.authz import Principal, claims_to_headers, extract_claims
 from _conventions.errors import AppError, ValidationError, global_handler, to_response
 from _conventions.idempotency import IdempotencyStore
 from _conventions.logger import set_correlation_id
@@ -117,7 +117,7 @@ def _match(method: str, path: str):
 
 
 def _principal(event) -> Principal | None:
-    claims = (((event.get("requestContext") or {}).get("authorizer") or {}).get("claims")) or {}
+    claims = extract_claims(event)
     if not claims:
         return None
     return Principal.from_claims(claims)
@@ -196,17 +196,21 @@ def _parse_limit(raw: str | None) -> int | None:
 
 def _execute(ctx, op, params, body, qs, principal, event) -> dict:
     token = _bearer_token(event)
+    # Fresh claims forwarded on every internal (private-API) call so the
+    # downstream builds its principal from them (the private API has no
+    # authorizer). Sent alongside the JWT during rollout.
+    ch = claims_to_headers(principal)
     p, a, d = ctx.profile_service, ctx.activity_service, ctx.directory_service
 
     if op == "getOwnProfile":
-        return _resp(200, p.get_own_profile(principal.user_id, bearer_token=token))
+        return _resp(200, p.get_own_profile(principal.user_id, bearer_token=token, claim_headers=ch))
     if op == "updateOwnProfile":
-        return _resp(200, p.update_own_profile(principal.user_id, body, bearer_token=token))
+        return _resp(200, p.update_own_profile(principal.user_id, body, bearer_token=token, claim_headers=ch))
     if op == "grantAvatarUpload":
         return _resp(200, p.grant_avatar_upload(principal.user_id, body))
     if op == "getMember":
         return _resp(200, p.get_member(params["id"], principal_role=principal.role,
-                                      principal=principal, bearer_token=token))
+                                      principal=principal, bearer_token=token, claim_headers=ch))
     if op == "browseDirectory":
         _validate_choice(qs.get("sort"), "sort",
                          {"firstName", "lastName", "email", "role", "city",
@@ -221,7 +225,7 @@ def _execute(ctx, op, params, body, qs, principal, event) -> dict:
             cert_id=qs.get("certId"),
             limit=_parse_limit(qs.get("limit")), cursor=qs.get("cursor"),
             sort=qs.get("sort", "firstName"), sort_dir=qs.get("sortDir", "asc"),
-            bearer_token=token,
+            bearer_token=token, claim_headers=ch,
         ))
     if op == "startDirectoryExport":
         # 202: the CSV does not exist yet. The worker builds it asynchronously
@@ -229,7 +233,7 @@ def _execute(ctx, op, params, body, qs, principal, event) -> dict:
         # the service (CL/UGL only), which is a STRICTER gate than the listing's
         # own group scoping — a Member can browse their groups but cannot export.
         return _resp(202, ctx.export_service.start_export(
-            body, principal=principal, bearer_token=token))
+            body, principal=principal, bearer_token=token, claim_headers=ch))
     if op == "getDirectoryExport":
         return _resp(200, ctx.export_service.get_export(params["id"], principal=principal))
     if op == "reindexMembers":
@@ -239,12 +243,13 @@ def _execute(ctx, op, params, body, qs, principal, event) -> dict:
             params["id"], principal_role=principal.role,
             principal_led_group_id=principal.led_group_id,
             date_from=qs.get("from"), date_to=qs.get("to"), bearer_token=token,
+            claim_headers=ch,
         ))
 
     # ---- Shoutouts (US-13) ----
     s = ctx.shoutout_service
     if op == "sendShoutout":
-        return _resp(201, s.send(body, principal=principal, bearer_token=token))
+        return _resp(201, s.send(body, principal=principal, bearer_token=token, claim_headers=ch))
     if op == "recentShoutouts":
         return _resp(200, s.recent_feed())
     if op == "allShoutouts":
@@ -257,7 +262,7 @@ def _execute(ctx, op, params, body, qs, principal, event) -> dict:
         qs = event.get("queryStringParameters") or {}
         return _resp(200, s.member_shoutouts(principal.user_id, cursor=qs.get("cursor"), limit=int(qs.get("limit", "20"))))
     if op == "shoutoutQuota":
-        return _resp(200, s.my_quota(principal=principal, bearer_token=token))
+        return _resp(200, s.my_quota(principal=principal, bearer_token=token, claim_headers=ch))
     if op == "memberShoutouts":
         return _resp(200, s.member_shoutouts(params["id"]))
     if op == "deleteShoutout":

@@ -50,13 +50,16 @@ class ProfileService:
             key, content_type=content_type, max_bytes=size)
 
     # ---------------- getOwnProfile (US-3.1) ----------------
-    def get_own_profile(self, member_id: str, *, bearer_token: str | None = None) -> dict:
+    def get_own_profile(self, member_id: str, *, bearer_token: str | None = None,
+                        claim_headers: dict | None = None) -> dict:
         profile = self._repo.get_profile(member_id) or {"id": member_id, "groups": []}
-        rollup, tiers, activity = self._fan_out_basic(member_id, bearer_token=bearer_token)
+        rollup, tiers, activity = self._fan_out_basic(
+            member_id, bearer_token=bearer_token, claim_headers=claim_headers)
         return profile_public(profile, rollup=rollup, tiers=tiers, activity_summary=activity)
 
     # ---------------- updateOwnProfile (US-3.2) ----------------
-    def update_own_profile(self, member_id: str, body: dict, *, bearer_token: str | None = None) -> dict:
+    def update_own_profile(self, member_id: str, body: dict, *, bearer_token: str | None = None,
+                           claim_headers: dict | None = None) -> dict:
         profile = self._repo.get_profile(member_id) or {"id": member_id, "groups": [], "createdAt": now_iso()}
         for field in EDITABLE_FIELDS:
             if field not in body:
@@ -102,18 +105,20 @@ class ProfileService:
             "city": profile.get("city"), "country": profile.get("country"),
             "professionalRole": profile.get("professionalRole"), "status": profile.get("status"),
         })
-        rollup, tiers, activity = self._fan_out_basic(member_id, bearer_token=bearer_token)
+        rollup, tiers, activity = self._fan_out_basic(
+            member_id, bearer_token=bearer_token, claim_headers=claim_headers)
         return profile_public(profile, rollup=rollup, tiers=tiers, activity_summary=activity)
 
     # ---------------- getMember (US-3.3) ----------------
     def get_member(self, member_id: str, *, principal_role: str, principal=None,
-                   bearer_token: str | None = None) -> dict:
+                   bearer_token: str | None = None, claim_headers: dict | None = None) -> dict:
         if principal_role == "Administrator":
             raise ForbiddenError()  # BR-4 — Admins use Identity's /users instead
         profile = self._repo.get_profile(member_id)
         if profile is None:
             raise NotFoundError()
-        rollup, tiers, activity = self._fan_out_basic(member_id, bearer_token=bearer_token)
+        rollup, tiers, activity = self._fan_out_basic(
+            member_id, bearer_token=bearer_token, claim_headers=claim_headers)
         # `principal` is optional so older callers/tests keep working; without it
         # the flag stays False and the button simply is not offered.
         can_shout = bool(principal) and can_send_shoutout(principal, profile)
@@ -121,7 +126,8 @@ class ProfileService:
                               can_shoutout=can_shout)
 
     # ---------------- shared fan-out (basic block, plan Q2 / BR-12) ----------------
-    def _fan_out_basic(self, member_id: str, *, bearer_token: str | None):
+    def _fan_out_basic(self, member_id: str, *, bearer_token: str | None,
+                       claim_headers: dict | None = None):
         results = self._fan_out.fan_out({
             "contributions": f"/contributions/me?memberId={member_id}",
             "events": f"/events?memberId={member_id}&countOnly=true",
@@ -131,7 +137,7 @@ class ProfileService:
             # to only forum-post ledger entries and countOnly skips serialisation.
             "forums": f"/contributions/history?memberId={member_id}&scope=all&activityFilter=Create+a+forum+post&countOnly=true",
             "certifications": f"/certifications/claims?memberId={member_id}&status=Approved&countOnly=true",
-        }, bearer_token=bearer_token)
+        }, bearer_token=bearer_token, claim_headers=claim_headers)
 
         contrib = results.get("contributions") or {}
         rollup = {"points": contrib.get("points", 0), "quarter": contrib.get("quarter", "")} if contrib else None

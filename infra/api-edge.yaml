@@ -95,15 +95,29 @@ Resources:
       DefinitionBody:
         swagger: '2.0'
         info: { title: !Sub "community-portal-${Stage}", version: '1.0' }
+        # Fresh-claims-at-the-edge (perf F3): the scheme keeps the name CognitoAuth
+        # — every route references it by name, so redefining it here flips them all
+        # at once — but it is now a CUSTOM REQUEST Lambda authorizer. It verifies the
+        # Cognito ID token AND injects the caller's FRESH claims (role / ledGroupId /
+        # member_group_ids, read from the CLAIMS projection) into the request
+        # context, so services trust those instead of a stale JWT or a per-request
+        # fan-out. TTL=0 => runs every request (no staleness window).
+        # Referenced by constructed function ARN (like the integration URIs), so
+        # this stack takes no dependency on the identity-access app stack (no cycle);
+        # the invoke permission lives with the function (ClaimsAuthorizerApiPermission).
+        # FLIP-BACK: restore the previous cognito_user_pools definition of this
+        # single block and redeploy — no route changes needed.
         securityDefinitions:
           CognitoAuth:
             type: apiKey
             name: Authorization
             in: header
-            x-amazon-apigateway-authtype: cognito_user_pools
+            x-amazon-apigateway-authtype: custom
             x-amazon-apigateway-authorizer:
-              type: cognito_user_pools
-              providerARNs: [ !Ref UserPoolArn ]
+              type: request
+              identitySource: method.request.header.Authorization
+              authorizerResultTtlInSeconds: 0
+              authorizerUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:claims-authorizer-${Stage}/invocations"
         # CORS on API Gateway's OWN error responses (401 from the Cognito
         # authorizer, 403, 5xx). Without these the browser blocks the response
         # and the SPA sees an opaque "Failed to fetch" instead of the real
@@ -1409,15 +1423,6 @@ Resources:
               Principal: '*'
               Action: execute-api:Invoke
               Resource: execute-api:/*
-        securityDefinitions:
-          CognitoAuth:
-            type: apiKey
-            name: Authorization
-            in: header
-            x-amazon-apigateway-authtype: cognito_user_pools
-            x-amazon-apigateway-authorizer:
-              type: cognito_user_pools
-              providerARNs: [ !Ref UserPoolArn ]
         x-amazon-apigateway-gateway-responses:
           DEFAULT_4XX:
             responseParameters:
@@ -1431,7 +1436,6 @@ Resources:
           /announcements:
             x-amazon-apigateway-any-method:
               produces: [ application/json ]
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -1463,7 +1467,6 @@ Resources:
               produces: [ application/json ]
               parameters:
                 - { name: proxy, in: path, required: true, type: string }
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -1553,7 +1556,6 @@ Resources:
           /certifications:
             x-amazon-apigateway-any-method:
               produces: [ application/json ]
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -1585,7 +1587,6 @@ Resources:
               produces: [ application/json ]
               parameters:
                 - { name: proxy, in: path, required: true, type: string }
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -1615,7 +1616,6 @@ Resources:
           /channels:
             x-amazon-apigateway-any-method:
               produces: [ application/json ]
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -1647,7 +1647,6 @@ Resources:
               produces: [ application/json ]
               parameters:
                 - { name: proxy, in: path, required: true, type: string }
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -1677,7 +1676,6 @@ Resources:
           /community-stats:
             x-amazon-apigateway-any-method:
               produces: [ application/json ]
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -1709,7 +1707,6 @@ Resources:
               produces: [ application/json ]
               parameters:
                 - { name: proxy, in: path, required: true, type: string }
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -1739,7 +1736,6 @@ Resources:
           /contributions:
             x-amazon-apigateway-any-method:
               produces: [ application/json ]
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -1771,7 +1767,6 @@ Resources:
               produces: [ application/json ]
               parameters:
                 - { name: proxy, in: path, required: true, type: string }
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -1861,7 +1856,6 @@ Resources:
           /events:
             x-amazon-apigateway-any-method:
               produces: [ application/json ]
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -1893,7 +1887,6 @@ Resources:
               produces: [ application/json ]
               parameters:
                 - { name: proxy, in: path, required: true, type: string }
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -1923,7 +1916,6 @@ Resources:
           /forums:
             x-amazon-apigateway-any-method:
               produces: [ application/json ]
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -1955,7 +1947,6 @@ Resources:
               produces: [ application/json ]
               parameters:
                 - { name: proxy, in: path, required: true, type: string }
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -1985,7 +1976,6 @@ Resources:
           /groups:
             x-amazon-apigateway-any-method:
               produces: [ application/json ]
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -2017,7 +2007,6 @@ Resources:
               produces: [ application/json ]
               parameters:
                 - { name: proxy, in: path, required: true, type: string }
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -2107,7 +2096,6 @@ Resources:
           /join-requests:
             x-amazon-apigateway-any-method:
               produces: [ application/json ]
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -2139,7 +2127,6 @@ Resources:
               produces: [ application/json ]
               parameters:
                 - { name: proxy, in: path, required: true, type: string }
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -2169,7 +2156,6 @@ Resources:
           /library:
             x-amazon-apigateway-any-method:
               produces: [ application/json ]
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -2201,7 +2187,6 @@ Resources:
               produces: [ application/json ]
               parameters:
                 - { name: proxy, in: path, required: true, type: string }
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -2231,7 +2216,6 @@ Resources:
           /members:
             x-amazon-apigateway-any-method:
               produces: [ application/json ]
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -2263,7 +2247,6 @@ Resources:
               produces: [ application/json ]
               parameters:
                 - { name: proxy, in: path, required: true, type: string }
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -2293,7 +2276,6 @@ Resources:
           /membership-history:
             x-amazon-apigateway-any-method:
               produces: [ application/json ]
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -2325,7 +2307,6 @@ Resources:
               produces: [ application/json ]
               parameters:
                 - { name: proxy, in: path, required: true, type: string }
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -2355,7 +2336,6 @@ Resources:
           /posts:
             x-amazon-apigateway-any-method:
               produces: [ application/json ]
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -2387,7 +2367,6 @@ Resources:
               produces: [ application/json ]
               parameters:
                 - { name: proxy, in: path, required: true, type: string }
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -2477,7 +2456,6 @@ Resources:
           /replies:
             x-amazon-apigateway-any-method:
               produces: [ application/json ]
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -2509,7 +2487,6 @@ Resources:
               produces: [ application/json ]
               parameters:
                 - { name: proxy, in: path, required: true, type: string }
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -2539,7 +2516,6 @@ Resources:
           /settings:
             x-amazon-apigateway-any-method:
               produces: [ application/json ]
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -2571,7 +2547,6 @@ Resources:
               produces: [ application/json ]
               parameters:
                 - { name: proxy, in: path, required: true, type: string }
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -2601,7 +2576,6 @@ Resources:
           /shoutouts:
             x-amazon-apigateway-any-method:
               produces: [ application/json ]
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -2633,7 +2607,6 @@ Resources:
               produces: [ application/json ]
               parameters:
                 - { name: proxy, in: path, required: true, type: string }
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -2663,7 +2636,6 @@ Resources:
           /users:
             x-amazon-apigateway-any-method:
               produces: [ application/json ]
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -2695,7 +2667,6 @@ Resources:
               produces: [ application/json ]
               parameters:
                 - { name: proxy, in: path, required: true, type: string }
-              security: [ { CognitoAuth: [] } ]
               responses: {}
               x-amazon-apigateway-integration:
                 type: aws_proxy
@@ -2894,6 +2865,12 @@ Resources:
 
 Outputs:
   RestApiId: { Value: !Ref Api }
+  # CloudWatch AWS/ApiGateway `ApiName` dimension = the REST API's name, which
+  # for a SAM Serverless::Api with a DefinitionBody is the swagger info.title.
+  # Exposed for the observability dashboards (Track A). Per-method detailed
+  # metrics are ALREADY enabled via the stage MethodSettings (MetricsEnabled),
+  # so Enablement C needs no further change.
+  RestApiName: { Value: !Sub "community-portal-${Stage}" }
   RootResourceId: { Value: !GetAtt Api.RootResourceId }
   ApiEndpoint: { Value: !Sub "https://${Api}.execute-api.${AWS::Region}.amazonaws.com/${Stage}" }
   PrivateRestApiId: { Value: !Ref PrivateApi }

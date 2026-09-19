@@ -52,38 +52,113 @@ def _seed(repo):
                       "role": "CommunityLeader", "status": "active", "skills": [], "groups": []})
 
 
+class _FullOs:
+    """OpenSearch stub over a fixed doc list. Honours the multi_match `q`, the
+    role/group/id filters, the default firstName sort, and search_after cursor
+    paging — enough to exercise browse() now that OpenSearch is the ONLY path.
+    """
+
+    def __init__(self, docs):
+        self._docs = docs
+        self.last_query = None
+
+    def _matching(self, body):
+        self.last_query = body.get("query")
+        bq = (body.get("query", {}) or {}).get("bool", {}) or {}
+        out = list(self._docs)
+        for m in bq.get("must", []) or []:
+            mm = m.get("multi_match")
+            if not mm:
+                continue
+            q = (mm.get("query") or "").lower()
+            fields = mm.get("fields", [])
+
+            def _hay(d):
+                parts = []
+                for f in fields:
+                    v = d.get(f)
+                    if isinstance(v, list):
+                        parts.append(" ".join(map(str, v)))
+                    elif v is not None:
+                        parts.append(str(v))
+                return " ".join(parts).lower()
+
+            out = [d for d in out if q in _hay(d)]
+        for f in bq.get("filter", []) or []:
+            term = f.get("term", {})
+            terms = f.get("terms", {})
+            if "role.keyword" in term:
+                out = [d for d in out if d.get("role") == term["role.keyword"]]
+            if "groupIds.keyword" in term:
+                out = [d for d in out if term["groupIds.keyword"] in set(d.get("groupIds", []))]
+            if "groupIds.keyword" in terms:
+                allowed = set(terms["groupIds.keyword"])
+                out = [d for d in out if allowed & set(d.get("groupIds", []))]
+            if "id.keyword" in terms:
+                ids = set(terms["id.keyword"])
+                out = [d for d in out if d.get("id") in ids]
+        out.sort(key=lambda d: (d.get("firstNameNorm", ""), d.get("id", "")))
+        return out
+
+    def search(self, index, body):  # noqa: ANN001
+        rows = self._matching(body)
+        size = body.get("size", 26)
+        search_after = body.get("search_after")
+        start = 0
+        if search_after:
+            last_id = search_after[-1]
+            for i, d in enumerate(rows):
+                if d["id"] == last_id:
+                    start = i + 1
+                    break
+        page = rows[start: start + size]
+        return {"hits": {"hits": [
+            {"_source": d, "sort": [d.get("firstNameNorm", ""), d["id"]]} for d in page]}}
+
+    def count(self, index, body):  # noqa: ANN001
+        return {"count": len(self._matching(body))}
+
+
+def _svc(repo, fan_out, settings_enabled=False):
+    """DirectoryService wired to a _FullOs stub built from whatever profiles have
+    been seeded into `repo` — browse() is now always OpenSearch-backed."""
+    docs = _os_docs(repo, repo.all_profiles())
+    os_stub = _FullOs(docs)
+    repo._os_client = lambda: os_stub
+    return DirectoryService(repo, fan_out, _SettingsCache(enabled=settings_enabled)), os_stub
+
+
 def test_browse_no_filters_returns_all(repo, fan_out):
     _seed(repo)
-    svc = DirectoryService(repo, fan_out, _SettingsCache(enabled=False))
+    svc, _ = _svc(repo, fan_out)
     out = svc.browse(principal=CL)
     assert out["count"] == 2
 
 
 def test_browse_by_role(repo, fan_out):
     _seed(repo)
-    svc = DirectoryService(repo, fan_out, _SettingsCache(enabled=False))
+    svc, _ = _svc(repo, fan_out)
     out = svc.browse(principal=CL, role="Member")
     assert out["count"] == 1
     assert out["items"][0]["id"] == "u1"
 
 
-def test_browse_keyword_fallback_when_semantic_off(repo, fan_out):
-    # keyword search with no limit/cursor hits the CSV-export (DynamoDB) path
+def test_browse_keyword_search_via_opensearch(repo, fan_out):
+    # keyword search is served by OpenSearch (multi_match over name/email/skills/…)
     _seed(repo)
-    svc = DirectoryService(repo, fan_out, _SettingsCache(enabled=False))
+    svc, _ = _svc(repo, fan_out)
     out = svc.browse(principal=CL, q="lambda")
     assert out["count"] == 1
     assert out["items"][0]["id"] == "u1"
-    assert fan_out.calls == []  # no Search call — semantic search removed
+    assert fan_out.calls == []  # no Search fan-out — semantic search removed
 
 
 def test_browse_semantic_search_removed_no_fan_out(repo, fan_out):
     """Semantic search fan-out replaced by OpenSearch; browse() never calls
     the Search service regardless of the EnableSemanticSearch flag."""
     _seed(repo)
-    svc = DirectoryService(repo, fan_out, _SettingsCache(enabled=True))
+    svc, _ = _svc(repo, fan_out, settings_enabled=True)
     out = svc.browse(principal=CL, q="alex")
-    # Hits the DynamoDB CSV-export path (no limit supplied), filters in-process
     assert out["count"] == 1
     assert out["items"][0]["id"] == "u1"
     # No Search service fan-out call
@@ -94,7 +169,7 @@ def test_community_leader_directory_omits_cert_filter(repo, fan_out):
     """BR-6 — CL-facing directory ignores the certId filter param."""
     _seed(repo)
     fan_out.responses = {"certifications": {"items": [{"memberId": "u1"}]}}
-    svc = DirectoryService(repo, fan_out, _SettingsCache(enabled=False))
+    svc, _ = _svc(repo, fan_out)
     out = svc.browse(principal=CL, cert_id="cert-x")
     assert out["count"] == 2  # cert filter ignored for CL — no fan-out call made
     assert fan_out.calls == []
@@ -103,7 +178,7 @@ def test_community_leader_directory_omits_cert_filter(repo, fan_out):
 def test_member_directory_applies_cert_filter(repo, fan_out):
     _seed(repo)
     fan_out.responses = {"certifications": {"items": [{"memberId": "u1"}]}}
-    svc = DirectoryService(repo, fan_out, _SettingsCache(enabled=False))
+    svc, _ = _svc(repo, fan_out)
     out = svc.browse(principal=UGL, cert_id="cert-x")
     assert out["count"] == 1
     assert out["items"][0]["id"] == "u1"
@@ -112,8 +187,8 @@ def test_member_directory_applies_cert_filter(repo, fan_out):
 def test_deactivated_members_remain_searchable_with_status(repo, fan_out):
     """US-3.5 — deactivated members remain in results (inactive status surfaced)."""
     repo.put_profile({"id": "u3", "firstName": "Ravi", "lastName": "Shah", "email": "r@x.com",
-                      "role": "Member", "status": "inactive", "groups": []})
-    svc = DirectoryService(repo, fan_out, _SettingsCache(enabled=False))
+                      "role": "Member", "status": "inactive", "skills": [], "groups": []})
+    svc, _ = _svc(repo, fan_out)
     out = svc.browse(principal=CL)
     ravi = next(i for i in out["items"] if i["id"] == "u3")
     assert ravi["status"] == "inactive"
@@ -234,10 +309,11 @@ def test_browse_paged_cert_and_keyword_filter_intersect(repo, fan_out):
     assert {i["id"] for i in out["items"]} == {"u002", "u005"}
 
 
-def test_browse_unpaged_path_unchanged_for_export(repo, fan_out):
-    """No limit/cursor -> full listing with no cursor field (CSV export, D-P3)."""
+def test_browse_no_limit_returns_first_page(repo, fan_out):
+    """No limit -> first page via OpenSearch (default 25), with no cursor when the
+    result fits on one page. There is no unpaged DynamoDB-scan path anymore."""
     _seed_many(repo, 4)
-    svc = DirectoryService(repo, fan_out, _SettingsCache(enabled=False))
+    svc, _ = _svc(repo, fan_out)
     out = svc.browse(principal=CL)
     assert out["count"] == 4
     assert "cursor" not in out
@@ -405,10 +481,10 @@ def test_count_and_search_agree_under_scoping(repo, fan_out, member_in_g1):
     assert total == len(rows) == 2
 
 
-def test_unpaged_export_path_is_also_scoped(repo, fan_out, member_in_g1):
-    """Unreachable over HTTP today (app.py always sends a limit), but the previous
-    code was unscoped in BOTH branches — leaving one open would restore the bug the
-    moment a caller omitted `limit`."""
+def test_no_limit_default_page_is_scoped_for_members(repo, fan_out, member_in_g1):
+    """A Member who omits `limit` still gets the scoped first page (default 25)
+    via OpenSearch — scope is pushed INTO the query, never a post-filter, and
+    there is no unpaged scan path that could bypass it."""
     svc, _ = _scoped_svc(repo, fan_out)
 
     out = svc.browse(principal=member_in_g1)

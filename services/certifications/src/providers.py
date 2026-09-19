@@ -213,10 +213,13 @@ class S3Broker:
 
 
 class IdentityClient:
-    """Sync membership read at submission (D3) + led-group fallback (D4).
+    """Led-group fallback (D4) for UGL claims when the JWT lacks led_group_id.
     Same JWT-forwarding pattern as member-profiles' FanOutClient — the caller's
     own token, so Identity's authZ applies unchanged; no service credential.
-    UNLIKE the fan-out this FAILS CLOSED: None here must become a 503 upstream."""
+    FAILS CLOSED: None here must become a 503 upstream.
+
+    Member group membership is no longer read here — it rides in the
+    authorizer-injected claims (fresh-claims-at-the-edge)."""
 
     def __init__(self, base_url: str | None = None, opener=None,
                  timeout: float = _IDENTITY_TIMEOUT):
@@ -241,16 +244,6 @@ class IdentityClient:
                 log(_logger, 30, "identity call failed",
                     path=path, attempt=attempt, error=str(err))
         return None
-
-    def member_group_ids(self, *, bearer_token: str | None) -> list[str] | None:
-        """The caller's CURRENT groups (read-time truth, not the login-time JWT
-        claim — a member may have joined a group since logging in). None means
-        Identity was unreachable — the caller must fail closed."""
-        data = self._get("/groups", bearer_token=bearer_token)
-        if data is None or not isinstance(data.get("items"), list):
-            return None
-        return [g["id"] for g in data["items"]
-                if isinstance(g, dict) and g.get("myState") == "member" and g.get("id")]
 
     def led_group_id(self, user_id: str, *, bearer_token: str | None) -> str | None:
         """Fallback when the JWT lacks led_group_id (D4). None = unresolvable

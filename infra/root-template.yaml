@@ -10,6 +10,7 @@ Metadata:
     ParameterGroups:
       - { Label: { default: General }, Parameters: [Stage, OpsEmail, AdminEmail] }
       - { Label: { default: Features }, Parameters: [EnableSemanticSearch, AllowedEmailDomains] }
+      - { Label: { default: Observability }, Parameters: [EnableObservabilityDashboards, EnableApplicationSignals, AppSignalsLayerArn] }
       - { Label: { default: Artifacts }, Parameters: [TemplateBaseUrl] }
 
 Parameters:
@@ -28,15 +29,32 @@ Parameters:
     ConstraintDescription: Must be a valid, deliverable email address.
   AllowedEmailDomains:
     Type: String
-    Default: 'amazon.com'
+    Default: 'example.com'
     Description: >
       Comma-separated self-registration allow-list for Identity & Access (US-1.30).
       Stop-gap parameter until the Settings service (Unit 11) exposes US-8.3 config.
   EnableSemanticSearch: { Type: String, Default: 'false', AllowedValues: ['true', 'false'] }
+  # ── Observability gating (both default OFF; opt-in per environment) ─────────
+  # Track A — CloudWatch operations dashboards (+ perf widgets, PITR/size custom
+  # metrics, KMS decrypt filter). Self-contained in observability.yaml; safe to
+  # toggle (stateless). See aidlc-docs/construction/observability/.
+  EnableObservabilityDashboards: { Type: String, Default: 'false', AllowedValues: ['true', 'false'] }
+  # Track B — Application Signals (APM: SLOs + transaction tracing). Gates the
+  # X-Ray VPC endpoint (foundation) AND per-Lambda ADOT instrumentation (service
+  # app stacks). Toggling this re-deploys every service stack.
+  EnableApplicationSignals: { Type: String, Default: 'false', AllowedValues: ['true', 'false'] }
+  # ADOT (AWS Distro for OpenTelemetry) Lambda layer ARN, region + runtime + arch
+  # specific. Required only when EnableApplicationSignals=true. Published by AWS,
+  # e.g. arn:aws:lambda:<region>:615299751070:layer:AWSOpenTelemetryDistroPython:<ver>.
+  AppSignalsLayerArn: { Type: String, Default: 'arn:aws:lambda:us-east-1:000000000000:layer:SET_APP_SIGNALS_LAYER_ARN:1' }
   DeployNonce: { Type: String, Default: '0', Description: Changes each deploy to re-run seed/SPA custom resources. }
   TemplateBaseUrl:
     Type: String
     Description: S3 base URL where nested templates were uploaded by `sam deploy`/`sam package`.
+
+Conditions:
+  # Gate the whole observability.yaml nested stack (Track A dashboards + SLOs).
+  DeployObservabilityDashboards: !Equals [ !Ref EnableObservabilityDashboards, 'true' ]
 
 Resources:
   # Encryption keys needed BEFORE the data stacks. Depends on nothing, and that is
@@ -56,6 +74,8 @@ Resources:
       Parameters:
         Stage: !Ref Stage
         OpsEmail: !Ref OpsEmail
+        # Gates the X-Ray VPC interface endpoint (Track B egress prerequisite).
+        EnableApplicationSignals: !Ref EnableApplicationSignals
         DynamoDbKmsAccessPolicyArn: !GetAtt Keys.Outputs.DynamoDbKmsAccessPolicyArn
         # Foundation now deploys AFTER IdentityAccessData because of this line.
         # TokenClaimsFunction is a Cognito trigger and cannot live anywhere else, so
@@ -99,6 +119,8 @@ Resources:
       TemplateURL: !Sub "${TemplateBaseUrl}/service-identity-access-app.yaml"
       Parameters:
         Stage: !Ref Stage
+        EnableApplicationSignals: !Ref EnableApplicationSignals
+        AppSignalsLayerArn: !Ref AppSignalsLayerArn
         RestApiId: !GetAtt ApiEdge.Outputs.RestApiId
         PrivateRestApiId: !GetAtt ApiEdge.Outputs.PrivateRestApiId
         RootResourceId: !GetAtt ApiEdge.Outputs.RootResourceId
@@ -153,6 +175,8 @@ Resources:
       TemplateURL: !Sub "${TemplateBaseUrl}/service-member-profiles-app.yaml"
       Parameters:
         Stage: !Ref Stage
+        EnableApplicationSignals: !Ref EnableApplicationSignals
+        AppSignalsLayerArn: !Ref AppSignalsLayerArn
         RestApiId: !GetAtt ApiEdge.Outputs.RestApiId
         PrivateRestApiId: !GetAtt ApiEdge.Outputs.PrivateRestApiId
         RootResourceId: !GetAtt ApiEdge.Outputs.RootResourceId
@@ -202,6 +226,8 @@ Resources:
       TemplateURL: !Sub "${TemplateBaseUrl}/service-events-app.yaml"
       Parameters:
         Stage: !Ref Stage
+        EnableApplicationSignals: !Ref EnableApplicationSignals
+        AppSignalsLayerArn: !Ref AppSignalsLayerArn
         RestApiId: !GetAtt ApiEdge.Outputs.RestApiId
         PrivateRestApiId: !GetAtt ApiEdge.Outputs.PrivateRestApiId
         RootResourceId: !GetAtt ApiEdge.Outputs.RootResourceId
@@ -230,11 +256,21 @@ Resources:
         # at the private API would mint links nobody outside the VPC can use.
         PublicUploadBaseUrl: !GetAtt ApiEdge.Outputs.ApiEndpoint
         EnableSemanticSearch: !Ref EnableSemanticSearch
+        # OpenSearch-backed Content Library search (US-2.20 rework). Same shared
+        # portal-search collection the member directory uses. The library rides
+        # it whenever the endpoint is set — independent of EnableSemanticSearch.
+        OpenSearchEndpoint: !GetAtt Foundation.Outputs.OpenSearchEndpoint
+        OpenSearchCollectionArn: !GetAtt Foundation.Outputs.OpenSearchCollectionArn
+        # Library table stream — feeds the OpenSearch indexer.
+        LibraryStreamArn: !GetAtt EventsData.Outputs.LibraryStreamArn
         OpsAlarmTopicArn: !GetAtt Foundation.Outputs.OpsAlarmTopicArn
         PrivateSubnetIds: !GetAtt Foundation.Outputs.PrivateSubnetIds
         LambdaSecurityGroupId: !GetAtt Foundation.Outputs.LambdaSecurityGroupId
         LogsKmsKeyArn: !GetAtt Foundation.Outputs.LogsKmsKeyArn
         DynamoDbKmsAccessPolicyArn: !GetAtt Keys.Outputs.DynamoDbKmsAccessPolicyArn
+        # SQS CMK + use policy for the library indexer DLQ (CKV_AWS_27 / cfn_nag W48).
+        SqsKmsKeyArn: !GetAtt Keys.Outputs.SqsKmsKeyArn
+        SqsKmsAccessPolicyArn: !GetAtt Keys.Outputs.SqsKmsAccessPolicyArn
 
   ForumsData:
     Type: AWS::CloudFormation::Stack
@@ -245,6 +281,8 @@ Resources:
       TemplateURL: !Sub "${TemplateBaseUrl}/service-forums-app.yaml"
       Parameters:
         Stage: !Ref Stage
+        EnableApplicationSignals: !Ref EnableApplicationSignals
+        AppSignalsLayerArn: !Ref AppSignalsLayerArn
         RestApiId: !GetAtt ApiEdge.Outputs.RestApiId
         PrivateRestApiId: !GetAtt ApiEdge.Outputs.PrivateRestApiId
         RootResourceId: !GetAtt ApiEdge.Outputs.RootResourceId
@@ -289,6 +327,8 @@ Resources:
       TemplateURL: !Sub "${TemplateBaseUrl}/service-certifications-app.yaml"
       Parameters:
         Stage: !Ref Stage
+        EnableApplicationSignals: !Ref EnableApplicationSignals
+        AppSignalsLayerArn: !Ref AppSignalsLayerArn
         RestApiId: !GetAtt ApiEdge.Outputs.RestApiId
         PrivateRestApiId: !GetAtt ApiEdge.Outputs.PrivateRestApiId
         RootResourceId: !GetAtt ApiEdge.Outputs.RootResourceId
@@ -321,6 +361,8 @@ Resources:
       TemplateURL: !Sub "${TemplateBaseUrl}/service-contributions-scoring-app.yaml"
       Parameters:
         Stage: !Ref Stage
+        EnableApplicationSignals: !Ref EnableApplicationSignals
+        AppSignalsLayerArn: !Ref AppSignalsLayerArn
         RestApiId: !GetAtt ApiEdge.Outputs.RestApiId
         PrivateRestApiId: !GetAtt ApiEdge.Outputs.PrivateRestApiId
         RootResourceId: !GetAtt ApiEdge.Outputs.RootResourceId
@@ -369,6 +411,8 @@ Resources:
       TemplateURL: !Sub "${TemplateBaseUrl}/service-announcements-app.yaml"
       Parameters:
         Stage: !Ref Stage
+        EnableApplicationSignals: !Ref EnableApplicationSignals
+        AppSignalsLayerArn: !Ref AppSignalsLayerArn
         RestApiId: !GetAtt ApiEdge.Outputs.RestApiId
         PrivateRestApiId: !GetAtt ApiEdge.Outputs.PrivateRestApiId
         RootResourceId: !GetAtt ApiEdge.Outputs.RootResourceId
@@ -402,6 +446,8 @@ Resources:
       TemplateURL: !Sub "${TemplateBaseUrl}/service-settings-app.yaml"
       Parameters:
         Stage: !Ref Stage
+        EnableApplicationSignals: !Ref EnableApplicationSignals
+        AppSignalsLayerArn: !Ref AppSignalsLayerArn
         RestApiId: !GetAtt ApiEdge.Outputs.RestApiId
         PrivateRestApiId: !GetAtt ApiEdge.Outputs.PrivateRestApiId
         RootResourceId: !GetAtt ApiEdge.Outputs.RootResourceId
@@ -444,6 +490,27 @@ Resources:
         ContributionsTableName: !GetAtt ContributionsScoringData.Outputs.TableName
         DeployNonce: !Ref DeployNonce
         DynamoDbKmsAccessPolicyArn: !GetAtt Keys.Outputs.DynamoDbKmsAccessPolicyArn
+
+  # ---------------------------------------------------------------------------
+  # Observability (Track A dashboards + perf widgets + PITR/size custom metrics
+  # + KMS decrypt filter + Application Signals SLOs). Entirely OPT-IN: the whole
+  # stack only exists when EnableObservabilityDashboards=true, so it adds no
+  # cost to environments that don't want it. It is a read-only consumer of other
+  # stacks' metrics (no other stack depends on it), so gating it off is safe and
+  # reversible. SLO resources inside are further gated on EnableApplicationSignals.
+  # ---------------------------------------------------------------------------
+  Observability:
+    Type: AWS::CloudFormation::Stack
+    Condition: DeployObservabilityDashboards
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/observability.yaml"
+      Parameters:
+        Stage: !Ref Stage
+        EnableApplicationSignals: !Ref EnableApplicationSignals
+        DistributionId: !GetAtt ApiEdge.Outputs.DistributionId
+        PublicApiName: !GetAtt ApiEdge.Outputs.RestApiName
+        OpsAlarmTopicArn: !GetAtt Foundation.Outputs.OpsAlarmTopicArn
+        LogsKmsKeyArn: !GetAtt Foundation.Outputs.LogsKmsKeyArn
 
 Outputs:
   PortalUrl: { Value: !GetAtt ApiEdge.Outputs.DistributionDomain }

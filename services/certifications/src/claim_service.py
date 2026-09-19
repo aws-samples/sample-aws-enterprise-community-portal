@@ -107,9 +107,9 @@ class ClaimService:
     def _resolve_credited_group(self, body: dict, principal, bearer_token: str | None) -> str:
         """Which group a claim is credited to (drives routing + points).
 
-        - Members credit a group they BELONG to (BR-C3): read-time membership
-          truth from Identity, not login-time JWT claims (a member may have
-          joined after logging in).
+        - Members credit a group they BELONG to (BR-C3): membership comes from
+          principal.member_group_ids, which the edge claims authorizer refreshes
+          from the database on every request (fresh-claims-at-the-edge).
         - UGLs credit the group they LEAD (change request 2026-08-07, Q1=A) —
           leadership, not membership, is the credit basis. Resolved JWT-first
           then Identity, and fail CLOSED if unresolvable: a claim credited to an
@@ -126,11 +126,7 @@ class ClaimService:
             return led
 
         group_id = require_str(body.get("creditedGroupId"), "creditedGroupId", max_len=100)
-        groups = self._identity.member_group_ids(bearer_token=bearer_token)
-        if groups is None:
-            raise AppError(code="DEPENDENCY_UNAVAILABLE",
-                           message="Group membership could not be verified. Please try again.",
-                           status=503)
+        groups = getattr(principal, "member_group_ids", []) or []
         if not groups:
             raise NoGroupError()
         require(group_id in groups, "creditedGroupId",

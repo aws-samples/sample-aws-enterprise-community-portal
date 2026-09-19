@@ -184,17 +184,22 @@ def decode_history_cursor(cursor: str) -> dict:
 
 
 def encode_group_cursor(item: dict) -> str:
-    """Opaque cursor for the paged group list (2026-08-08, high-volume CL table).
-    Group ids aren't enumerable by one partition, so the page is a Scan and the
-    cursor is the last returned META row's table key (pk/sk)."""
+    """Opaque cursor for the paged group list. The page is a Query on GSI4, so
+    resuming needs the full LastEvaluatedKey shape — the base table key (pk/sk)
+    AND the index key (gsi4pk/gsi4sk) — carried on the last returned META row."""
     return base64.urlsafe_b64encode(
-        json.dumps({"pk": item["pk"], "sk": item["sk"]}).encode()).decode()
+        json.dumps({k: item[k] for k in ("pk", "sk", "gsi4pk", "gsi4sk") if k in item}
+                   ).encode()).decode()
+
+
+_GROUP_CURSOR_KEYS = {"pk", "sk", "gsi4pk", "gsi4sk"}
 
 
 def decode_group_cursor(cursor: str) -> dict:
     try:
         key = json.loads(base64.urlsafe_b64decode(cursor.encode()))
-        if not isinstance(key, dict) or set(key) != {"pk", "sk"} \
+        if not isinstance(key, dict) or not key \
+                or not set(key) <= _GROUP_CURSOR_KEYS \
                 or not all(isinstance(v, str) for v in key.values()):
             raise ValueError("bad cursor shape")
         return key
@@ -216,7 +221,74 @@ class IdentityRepository:
         item["gsi2pk"] = f"ROLE#{user['role']}"
         item["gsi2sk"] = f"USER#{user['id']}"
         self._t.put_item(Item=item)
+        # Claims projection (fresh-claims-at-the-edge): put_user is the single
+        # funnel for user create / edit / role change / JIT, so mirroring role +
+        # ledGroupId onto the CLAIMS item here keeps it current from ONE place.
+        # First write also creates the item (memberGroupIds filled by membership
+        # events). The edge authorizer reads this item instead of the stale JWT.
+        self._sync_claims_identity(user["id"], user.get("role", ROLE_MEMBER),
+                                   user.get("ledGroupId"))
         return user
+
+    # ---------- Claims projection (fresh-claims-at-the-edge) ----------
+    @staticmethod
+    def _claims_key(user_id: str) -> dict:
+        return {"pk": f"MEMBER#{user_id}", "sk": "CLAIMS"}
+
+    def _sync_claims_identity(self, user_id: str, role: str,
+                              led_group_id: str | None) -> None:
+        """Mirror role + ledGroupId onto the CLAIMS item (called from put_user).
+        `role` and `version` are DynamoDB reserved words, so aliased. ledGroupId
+        is REMOVEd when the user is not a leader, so a demoted UGL's stale led
+        group cannot linger in the claim the edge trusts."""
+        sets = ["#r = :r"]
+        values = {":r": role, ":one": 1}
+        expr_remove = ""
+        if led_group_id:
+            sets.append("ledGroupId = :l")
+            values[":l"] = led_group_id
+        else:
+            expr_remove = " REMOVE ledGroupId"
+        expr = "SET " + ", ".join(sets) + " ADD #v :one" + expr_remove
+        self._t.update_item(
+            Key=self._claims_key(user_id),
+            UpdateExpression=expr,
+            ExpressionAttributeNames={"#r": "role", "#v": "version"},
+            ExpressionAttributeValues=values,
+        )
+
+    def get_member_claims(self, user_id: str) -> dict | None:
+        """Read the materialized claims for the edge authorizer. Returns None
+        when absent (caller fails closed). memberGroupIds is a String Set in
+        storage; returned as a sorted list ([] when absent)."""
+        item = self._t.get_item(Key=self._claims_key(user_id)).get("Item")
+        if not item:
+            return None
+        groups = item.get("memberGroupIds")
+        return {
+            "role": item.get("role", ROLE_MEMBER),
+            "ledGroupId": item.get("ledGroupId") or None,
+            "memberGroupIds": sorted(groups) if groups else [],
+            "version": int(item.get("version", 0)),
+        }
+
+    def rebuild_member_claims(self, user: dict) -> dict:
+        """Recompute and overwrite a user's CLAIMS item from source of truth
+        (user record + folded membership events). Used by the one-time backfill
+        and as the drift-repair path. Idempotent. Only members carry
+        memberGroupIds (mirrors token_claims_handler)."""
+        user_id = user["id"]
+        role = user.get("role", ROLE_MEMBER)
+        item = {**self._claims_key(user_id), "role": role, "version": 1}
+        led = user.get("ledGroupId") or None
+        if led:
+            item["ledGroupId"] = led
+        if role == ROLE_MEMBER:
+            groups = self.current_groups_for_member(user_id)
+            if groups:
+                item["memberGroupIds"] = set(groups)
+        self._t.put_item(Item=item)
+        return item
 
     def get_user(self, user_id: str) -> dict | None:
         resp = self._t.get_item(Key={"pk": f"USER#{user_id}", "sk": "PROFILE"})
@@ -481,6 +553,15 @@ class IdentityRepository:
         item = dict(group)
         item["pk"] = f"GROUP#{group['id']}"
         item["sk"] = "META"
+        # GSI4: place every group META row under a single partition so the group
+        # catalogue is a Query, not a full-table Scan (perf fix — the identity
+        # table also holds ~30k users + memberships, so a Scan reads all of them).
+        # Set here (a full put_item) so ALL 7 write paths — create/edit/delete/
+        # restore/assign_leader/_reassign_leader/_release_leadership — are covered
+        # by this one choke point; a soft-deleted row keeps gsi4* and is filtered
+        # by `status` on read, so it still appears when include_deleted=True.
+        item["gsi4pk"] = "GROUP"
+        item["gsi4sk"] = group["id"]
         self._t.put_item(Item=item)
         return group
 
@@ -493,47 +574,44 @@ class IdentityRepository:
         return groups
 
     def list_groups_with_counts(self, include_deleted: bool = False) -> tuple[list[dict], dict[str, int]]:
-        """Groups plus their member counts in ONE table pass.
+        """Groups plus their member counts.
 
-        Group ids are not enumerable by a single partition, so this is a Scan
-        filtered to the two small row types (bounded — the number of groups is
-        small). Returning the counters here is what lets `list_groups` stop
-        folding the whole membership event history once per group."""
-        items, kwargs = [], {}
+        Groups are a small curated catalogue but they live in a table dominated
+        by ~30k users + memberships, so listing them via a Scan cost O(table).
+        GSI4 places every group META row under one partition (gsi4pk="GROUP"),
+        so this is a Query whose cost is O(#groups). Member counts live on the
+        separate GROUP#<id>/MEMBERCOUNT items and are read per returned group
+        (a handful of GetItems) — the (groups, counts) contract is unchanged."""
+        groups: list[dict] = []
+        kwargs: dict = {"IndexName": "GSI4",
+                        "KeyConditionExpression": Key("gsi4pk").eq("GROUP")}
         while True:
-            resp = self._t.scan(
-                FilterExpression=Attr("sk").is_in(["META", "MEMBERCOUNT"]),
-                **kwargs,
-            )
-            items.extend(resp.get("Items", []))
+            resp = self._t.query(**kwargs)
+            groups.extend(resp.get("Items", []))
             if "LastEvaluatedKey" in resp:
                 kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
             else:
                 break
-        groups = [i for i in items if i.get("sk") == "META"]
-        counts = {i["pk"][len("GROUP#"):]: int(i.get("memberCount", 0))
-                  for i in items if i.get("sk") == "MEMBERCOUNT"}
         if not include_deleted:
             groups = [g for g in groups if g.get("status", GROUP_ACTIVE) == GROUP_ACTIVE]
+        counts = {g["id"]: self.group_member_count(g["id"]) for g in groups}
         return groups, counts
 
     def list_groups_page(self, *, include_deleted: bool = False, limit: int = 25,
                          cursor: str | None = None) -> tuple[list[dict], str | None]:
         """One page of group META rows (2026-08-08, high-volume CL "All Groups"
-        table). Same Scan basis as `list_groups_with_counts` (group ids aren't
-        enumerable by a single partition) but filtered to META rows only and
-        walked page-by-page: fetch-until-full with the status filter applied
-        in-loop so a page never comes back short while more matches exist.
-        Returns (groups, next_cursor); member counts + leaders are resolved per
-        page by the service, bounding that work to page size. Ordering follows
-        the Scan (no client sort under server paging — same tradeoff as the
-        admin user list and Member Directory)."""
+        table). Queries GSI4 (gsi4pk="GROUP") ordered by gsi4sk (=group id)
+        instead of scanning the whole table. Fetch-until-full with the status
+        filter applied in-loop so a page never comes back short while more
+        matches exist. Returns (groups, next_cursor); member counts + leaders are
+        resolved per page by the service, bounding that work to page size."""
         groups: list[dict] = []
-        kwargs: dict = {"FilterExpression": Attr("sk").eq("META")}
+        kwargs: dict = {"IndexName": "GSI4",
+                        "KeyConditionExpression": Key("gsi4pk").eq("GROUP")}
         if cursor:
             kwargs["ExclusiveStartKey"] = decode_group_cursor(cursor)
         while True:
-            resp = self._t.scan(**kwargs)
+            resp = self._t.query(**kwargs)
             for g in resp.get("Items", []):
                 if include_deleted or g.get("status", GROUP_ACTIVE) == GROUP_ACTIVE:
                     groups.append(g)
@@ -597,10 +675,29 @@ class IdentityRepository:
         item["gsi3pk"] = f"GROUP#{event['groupId']}"
         item["gsi3sk"] = f"MEVENT#{event['at']}"
         self._t.put_item(Item=item)
+        gid = event["groupId"]
         if event["type"] in MEVENT_START:
-            self.put_group_member(event["groupId"], event["memberId"], joined_at=event.get("at"))
+            self.put_group_member(gid, event["memberId"], joined_at=event.get("at"))
+            # Claims projection: add the group to the member's live set. ADD on a
+            # String Set is idempotent and race-free (no read-modify-write), and
+            # creates the CLAIMS item if a membership event somehow precedes the
+            # user's first put_user. #v = version (reserved word).
+            self._t.update_item(
+                Key=self._claims_key(event["memberId"]),
+                UpdateExpression="ADD memberGroupIds :g, #v :one",
+                ExpressionAttributeNames={"#v": "version"},
+                ExpressionAttributeValues={":g": {gid}, ":one": 1},
+            )
         elif event["type"] in MEVENT_END:
-            self.delete_group_member(event["groupId"], event["memberId"])
+            self.delete_group_member(gid, event["memberId"])
+            # DELETE from the Set; removing the last element deletes the
+            # attribute entirely (matches the "absent == no groups" read contract).
+            self._t.update_item(
+                Key=self._claims_key(event["memberId"]),
+                UpdateExpression="DELETE memberGroupIds :g ADD #v :one",
+                ExpressionAttributeNames={"#v": "version"},
+                ExpressionAttributeValues={":g": {gid}, ":one": 1},
+            )
         return event
 
     # ---------- Current-membership projection (2026-08-05, 13k+ scale) ----------

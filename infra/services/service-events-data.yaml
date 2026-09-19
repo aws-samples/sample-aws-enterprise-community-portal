@@ -215,6 +215,11 @@ Resources:
             - { AttributeName: gsi3pk, KeyType: HASH }
             - { AttributeName: gsi3sk, KeyType: RANGE }
           Projection: { ProjectionType: ALL }
+      # Stream feeds the LibraryIndexerFn, which mirrors every search-visible
+      # resource into the OpenSearch 'library' index (US-2.20 search rework).
+      # NEW_AND_OLD_IMAGES so the indexer can read the full post-write image and
+      # apply the same Clean/Link visibility rule the sparse GSI1 key encodes.
+      StreamSpecification: { StreamViewType: NEW_AND_OLD_IMAGES }
 
 Outputs:
   TableName: { Value: !Ref Table }
@@ -225,3 +230,4 @@ Outputs:
   IdeasTableArn: { Value: !GetAtt IdeasTable.Arn }
   LibraryTableName: { Value: !Ref LibraryTable }
   LibraryTableArn: { Value: !GetAtt LibraryTable.Arn }
+  LibraryStreamArn: { Value: !GetAtt LibraryTable.StreamArn }

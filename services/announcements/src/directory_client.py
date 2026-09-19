@@ -31,12 +31,15 @@ class DirectoryClient:
             (int(env_timeout) / 1000.0) if env_timeout else _DEFAULT_TIMEOUT_SECONDS)
         self._opener = opener or urlrequest.urlopen
 
-    def _get(self, path: str, *, bearer_token: str | None) -> dict | None:
+    def _get(self, path: str, *, bearer_token: str | None,
+             claim_headers: dict | None = None) -> dict | None:
         if not self.base_url or not self.base_url.startswith("https://"):
             return None  # only https:// same-account API GW permitted (SECURITY-01/07, S310)
         req = urlrequest.Request(f"{self.base_url}{path}", method="GET")  # noqa: S310 — scheme validated
         if bearer_token:
             req.add_header("Authorization", f"Bearer {bearer_token}")
+        for hk, hv in (claim_headers or {}).items():
+            req.add_header(hk, hv)
         try:
             with self._opener(req, timeout=self.timeout) as resp:  # noqa: S310 — scheme validated
                 body = resp.read()
@@ -45,16 +48,20 @@ class DirectoryClient:
             log(_logger, 30, "directory lookup failed (degrading fail-closed)", path=path, error=str(err))
             return None
 
-    def member_name(self, member_id: str, *, bearer_token: str | None = None) -> str | None:
-        data = self._get(f"/members/{member_id}", bearer_token=bearer_token)
+    def member_name(self, member_id: str, *, bearer_token: str | None = None,
+                    claim_headers: dict | None = None) -> str | None:
+        data = self._get(f"/members/{member_id}", bearer_token=bearer_token,
+                         claim_headers=claim_headers)
         if not data:
             return None
         first, last = data.get("firstName") or "", data.get("lastName") or ""
         name = f"{first} {last}".strip()
         return name or data.get("email") or None
 
-    def group_name(self, group_id: str, *, bearer_token: str | None = None) -> str | None:
-        data = self._get(f"/groups/{group_id}", bearer_token=bearer_token)
+    def group_name(self, group_id: str, *, bearer_token: str | None = None,
+                   claim_headers: dict | None = None) -> str | None:
+        data = self._get(f"/groups/{group_id}", bearer_token=bearer_token,
+                         claim_headers=claim_headers)
         if not data:
             return None
         return data.get("name") or None

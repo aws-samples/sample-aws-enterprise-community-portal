@@ -66,8 +66,10 @@ class FakeFanOut:
         self.failing: set[str] = set()
         self.calls: list[dict] = []
 
-    def fan_out(self, calls: dict[str, str], *, bearer_token: str | None = None) -> dict:
-        self.calls.append({"calls": calls, "token": bearer_token})
+    def fan_out(self, calls: dict[str, str], *, bearer_token: str | None = None,
+                claim_headers: dict | None = None) -> dict:
+        self.calls.append({"calls": calls, "token": bearer_token,
+                           "claim_headers": claim_headers})
         out = {}
         for svc in calls:
             out[svc] = None if svc in self.failing else self.responses.get(svc)

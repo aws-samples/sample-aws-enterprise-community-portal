@@ -29,18 +29,24 @@ class MentionClient:
             )
         self._base_url = raw
 
-    def suggest(self, q: str, group_id: str, bearer_token: str | None) -> list[dict]:
+    def suggest(self, q: str, group_id: str, bearer_token: str | None,
+                claim_headers: dict | None = None) -> list[dict]:
         """Return mention candidates for the given prefix + group.
 
         Fail-soft: on timeout/error returns empty list (post still succeeds).
+        `claim_headers` forward the caller's fresh claims to member-profiles'
+        browseDirectory (this is the one internal call gated on the caller's own
+        member_group_ids), so scoping stays fresh on the private path.
         """
         if not self._base_url or not q:
             return []
         url = f"{self._base_url}/members?q={quote(q, safe='')}&groupId={quote(group_id, safe='')}&limit=10"
         try:
+            headers = {"Authorization": f"Bearer {bearer_token}"} if bearer_token else {}
+            headers.update(claim_headers or {})
             resp = requests.get(
                 url,
-                headers={"Authorization": f"Bearer {bearer_token}"} if bearer_token else {},
+                headers=headers,
                 timeout=_TIMEOUT_S,
             )
             resp.raise_for_status()
@@ -50,7 +56,8 @@ class MentionClient:
             return []
 
     def validate_mentions(
-        self, user_ids: list[str], group_id: str, bearer_token: str | None
+        self, user_ids: list[str], group_id: str, bearer_token: str | None,
+        claim_headers: dict | None = None
     ) -> list[str]:
         """Validate mentioned user IDs against group access.
 
@@ -63,9 +70,11 @@ class MentionClient:
         # At community scale, the group member list is bounded
         url = f"{self._base_url}/members?groupId={quote(group_id, safe='')}&limit=200"
         try:
+            headers = {"Authorization": f"Bearer {bearer_token}"} if bearer_token else {}
+            headers.update(claim_headers or {})
             resp = requests.get(
                 url,
-                headers={"Authorization": f"Bearer {bearer_token}"} if bearer_token else {},
+                headers=headers,
                 timeout=_TIMEOUT_S,
             )
             resp.raise_for_status()

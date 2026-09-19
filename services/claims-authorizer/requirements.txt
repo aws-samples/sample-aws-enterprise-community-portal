@@ -1,0 +1,12 @@
+# Claims edge authorizer — pinned runtime deps (SECURITY-10; vendored at package time).
+#
+# python-jose (base install, NOT the [cryptography] extra) uses the pure-Python
+# rsa/ecdsa/pyasn1 backend. That matters here: the build vendors deps with
+# `pip install -t` on the developer's machine, and a native wheel (cryptography)
+# would be built for the wrong platform and fail on the Lambda Linux runtime.
+# Pure-Python packages are platform-agnostic, so they vendor correctly.
+#
+# boto3 is intentionally NOT pinned here — the Lambda runtime provides it, and
+# this authorizer runs on every request, so the package is kept minimal to bound
+# cold-start (design §3).
+python-jose==3.3.0

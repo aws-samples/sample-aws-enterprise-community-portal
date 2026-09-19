@@ -200,7 +200,7 @@ class FakeContributions:
         self.failing = failing
         self.calls = 0
 
-    def points_for(self, event_type, *, bearer_token=None):
+    def points_for(self, event_type, *, bearer_token=None, claim_headers=None):
         self.calls += 1
         if self.failing:
             return {"attendance": None, "delivery": None}
@@ -237,7 +237,7 @@ class FakeDirectory:
         self.failing = failing
         self.calls = 0
 
-    def lookup(self, user_id, *, bearer_token=None):
+    def lookup(self, user_id, *, bearer_token=None, claim_headers=None):
         self.calls += 1
         if self.failing:
             return None

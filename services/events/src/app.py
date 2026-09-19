@@ -20,7 +20,7 @@ import json
 import os
 import re
 
-from _conventions.authz import Principal
+from _conventions.authz import Principal, claims_to_headers, extract_claims
 from _conventions.errors import (
     AppError,
     ForbiddenError,
@@ -245,7 +245,7 @@ def _match(method: str, path: str):
 
 
 def _principal(event) -> Principal | None:
-    claims = (((event.get("requestContext") or {}).get("authorizer") or {}).get("claims")) or {}
+    claims = extract_claims(event)
     if not claims:
         return None
     principal = Principal.from_claims(claims)
@@ -285,6 +285,18 @@ def dispatch(event: dict, ctx: Context) -> dict:
     path = event.get("path", "/")
     set_correlation_id((event.get("headers") or {}).get("X-Correlation-Id"))
     correlation_id = (event.get("headers") or {}).get("X-Correlation-Id")
+
+    # --- backfill / reconciliation: full DynamoDB -> OpenSearch reindex ------
+    # Not an HTTP route. Invoked directly (aws lambda invoke) with
+    # {"source": "library-reindex"} by scripts/backfill_library_opensearch.py.
+    # MUST run in-VPC: the AOSS collection is VPC-only (foundation network policy
+    # AllowFromPublic:false), so a local script cannot reach the endpoint. This
+    # mirrors member-profiles' scheduled-reindex branch.
+    if event.get("source") == "library-reindex":
+        if ctx.library_repo is None:
+            return _resp(503, {"code": "SERVICE_UNAVAILABLE",
+                               "message": "Content Library table not configured."})
+        return _resp(200, {"indexed": ctx.library_repo.reindex_all()})
 
     # --- branch 3/4: event-driven inputs (no HTTP context) -------------------
     detail_type = event.get("detail-type") or event.get("type")
@@ -338,19 +350,22 @@ def dispatch(event: dict, ctx: Context) -> dict:
 
 def _execute(ctx, op, params, body, qs, principal, event, correlation_id) -> dict:
     token = _bearer_token(event)
+    # Fresh claims forwarded on internal (private-API) calls (points framework,
+    # designee directory lookup) so the downstream builds its principal from them.
+    ch = claims_to_headers(principal)
     event_id = params.get("id")
 
     if op == "listEvents":
         return _resp(200, ctx.event_service.list(
             principal=principal, filters=qs, limit=_parse_limit(qs.get("limit")),
-            cursor=qs.get("cursor"), bearer_token=token))
+            cursor=qs.get("cursor"), bearer_token=token, claim_headers=ch))
     if op == "createEvent":
         return _resp(201, ctx.event_service.create(
             body, principal=principal, correlation_id=correlation_id,
-            bearer_token=token))
+            bearer_token=token, claim_headers=ch))
     if op == "calendar":
         return _resp(200, ctx.event_service.calendar(
-            principal=principal, filters=qs, bearer_token=token))
+            principal=principal, filters=qs, bearer_token=token, claim_headers=ch))
     if op == "eventStatsByGroup":
         qs = event.get("queryStringParameters") or {}
         return _resp(200, ctx.event_service.stats_by_group(qs, principal=principal))
@@ -358,7 +373,7 @@ def _execute(ctx, op, params, body, qs, principal, event, correlation_id) -> dic
         return _resp(200, ctx.event_service.stats_by_type(qs, principal=principal))
     if op == "getEvent":
         return _resp(200, ctx.event_service.get(
-            event_id, principal=principal, bearer_token=token))
+            event_id, principal=principal, bearer_token=token, claim_headers=ch))
     if op == "editEvent":
         return _resp(200, ctx.event_service.edit(
             event_id, body, principal=principal, correlation_id=correlation_id))
@@ -367,7 +382,8 @@ def _execute(ctx, op, params, body, qs, principal, event, correlation_id) -> dic
         return {"statusCode": 204, "headers": {"Access-Control-Allow-Origin": "*"}, "body": ""}
     if op == "completeEvent":
         return _resp(200, ctx.event_service.complete(
-            event_id, principal=principal, correlation_id=correlation_id, bearer_token=token))
+            event_id, principal=principal, correlation_id=correlation_id, bearer_token=token,
+            claim_headers=ch))
     if op == "getEventIcs":
         ics = ctx.rsvps.ics_for(event_id, principal=principal)
         return _text_resp(200, ics, "text/calendar", f"{event_id}.ics")
@@ -405,10 +421,10 @@ def _execute(ctx, op, params, body, qs, principal, event, correlation_id) -> dic
             bearer_token=token))
     if op == "listDesignations":
         return _resp(200, ctx.designations.list_for(event_id, principal=principal,
-                                                    bearer_token=token))
+                                                    bearer_token=token, claim_headers=ch))
     if op == "setDesignations":
         return _resp(200, ctx.designations.set(event_id, body, principal=principal,
-                                               bearer_token=token))
+                                               bearer_token=token, claim_headers=ch))
     if op == "listUploadLinks":
         return _resp(200, ctx.upload_links.list_for_event(event_id, principal=principal))
     if op == "createUploadLink":
