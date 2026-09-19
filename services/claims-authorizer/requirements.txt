@@ -9,4 +9,4 @@
 # boto3 is intentionally NOT pinned here — the Lambda runtime provides it, and
 # this authorizer runs on every request, so the package is kept minimal to bound
 # cold-start (design §3).
-python-jose==3.3.0
+python-jose==3.4.0
