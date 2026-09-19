@@ -75,6 +75,8 @@ Resources:
         - { AttributeName: gsi2sk, AttributeType: S }
         - { AttributeName: gsi3pk, AttributeType: S }
         - { AttributeName: gsi3sk, AttributeType: S }
+        - { AttributeName: gsi4pk, AttributeType: S }
+        - { AttributeName: gsi4sk, AttributeType: S }
       KeySchema:
         - { AttributeName: pk, KeyType: HASH }
         - { AttributeName: sk, KeyType: RANGE }
@@ -93,6 +95,14 @@ Resources:
           KeySchema:
             - { AttributeName: gsi3pk, KeyType: HASH }
             - { AttributeName: gsi3sk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: GSI4   # group catalogue: all group META rows under one partition
+                            # (gsi4pk="GROUP", gsi4sk=<groupId>) so listGroups is a
+                            # Query, not a full-table Scan. Sparse: only group META
+                            # rows carry gsi4pk. See repository.put_group / list_groups*.
+          KeySchema:
+            - { AttributeName: gsi4pk, KeyType: HASH }
+            - { AttributeName: gsi4sk, KeyType: RANGE }
           Projection: { ProjectionType: ALL }
       StreamSpecification: { StreamViewType: NEW_AND_OLD_IMAGES }
   IdempotencyTable:

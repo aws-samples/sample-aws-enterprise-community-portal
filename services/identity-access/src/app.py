@@ -10,7 +10,7 @@ import os
 import pathlib
 import re
 
-from _conventions.authz import Authorizer, Principal
+from _conventions.authz import Authorizer, Principal, extract_claims
 from _conventions.errors import (
     AppError,
     ForbiddenError,
@@ -256,7 +256,7 @@ def _match(method: str, path: str):
 
 
 def _principal(event) -> Principal | None:
-    claims = (((event.get("requestContext") or {}).get("authorizer") or {}).get("claims")) or {}
+    claims = extract_claims(event)
     if not claims:
         return None
     return Principal.from_claims(claims)

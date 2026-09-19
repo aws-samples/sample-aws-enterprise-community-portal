@@ -46,3 +46,12 @@ load-testing/
 
 # System test cases — local development artifacts, not committed to the repo
 system-testcases/
+
+# Performance/load test artifacts and results — local, not committed
+perftest/
+
+# Local scripts — not committed
+scripts/
+
+# AI-DLC workflow documentation — local, not committed
+aidlc-docs/

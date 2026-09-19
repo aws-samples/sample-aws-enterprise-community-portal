@@ -235,7 +235,8 @@ class ContributionsClient:
         self.timeout = timeout
         self._opener = opener or urlrequest.urlopen
 
-    def _get(self, path: str, *, bearer_token: str | None) -> dict | None:
+    def _get(self, path: str, *, bearer_token: str | None,
+             claim_headers: dict | None = None) -> dict | None:
         if not self.base_url or not self.base_url.startswith("https://"):
             # Only https:// same-account API Gateway endpoints are permitted
             # (SECURITY-01/07); reject anything else before building a request.
@@ -243,6 +244,8 @@ class ContributionsClient:
         req = urlrequest.Request(f"{self.base_url}{path}", method="GET")  # noqa: S310 — scheme validated
         if bearer_token:
             req.add_header("Authorization", f"Bearer {bearer_token}")
+        for hk, hv in (claim_headers or {}).items():
+            req.add_header(hk, hv)
         try:
             with self._opener(req, timeout=self.timeout) as resp:  # noqa: S310 — scheme validated
                 body = resp.read()
@@ -252,13 +255,15 @@ class ContributionsClient:
                 path=path, error=str(err))
             return None
 
-    def points_for(self, event_type: str, *, bearer_token: str | None = None) -> dict:
+    def points_for(self, event_type: str, *, bearer_token: str | None = None,
+                   claim_headers: dict | None = None) -> dict:
         """Returns {"attendance": int|None, "delivery": int|None}."""
         cached = self._cache.get(event_type)
         if cached and (time.monotonic() - cached[0]) < self.CACHE_TTL_SECONDS:
             return cached[1]
         with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(self._get, "/contributions/framework", bearer_token=bearer_token)
+            future = pool.submit(self._get, "/contributions/framework",
+                                 bearer_token=bearer_token, claim_headers=claim_headers)
             framework = future.result()
         values = {"attendance": None, "delivery": None}
         for row in ((framework or {}).get("items") or []):
@@ -298,7 +303,8 @@ class DirectoryClient:
         self.timeout = timeout
         self._opener = opener or urlrequest.urlopen
 
-    def lookup(self, user_id: str, *, bearer_token: str | None = None) -> dict | None:
+    def lookup(self, user_id: str, *, bearer_token: str | None = None,
+               claim_headers: dict | None = None) -> dict | None:
         """Returns {"role": str, "displayName": str} or None when unverifiable."""
         if not self.base_url or not self.base_url.startswith("https://"):
             return None  # SECURITY-01/07 — https same-account API GW only
@@ -307,6 +313,8 @@ class DirectoryClient:
         req = urlrequest.Request(f"{self.base_url}/members/{user_id}", method="GET")  # noqa: S310 — scheme validated
         if bearer_token:
             req.add_header("Authorization", f"Bearer {bearer_token}")
+        for hk, hv in (claim_headers or {}).items():
+            req.add_header(hk, hv)
         try:
             with self._opener(req, timeout=self.timeout) as resp:  # noqa: S310 — scheme validated
                 body = resp.read()

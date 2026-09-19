@@ -86,7 +86,8 @@ class ExportService:
             f"member-profiles-export-{os.environ.get('STAGE', 'dev')}")
 
     # ---------------- start (POST /members/export) ----------------
-    def start_export(self, body: dict, *, principal, bearer_token: str | None = None) -> dict:
+    def start_export(self, body: dict, *, principal, bearer_token: str | None = None,
+                     claim_headers: dict | None = None) -> dict:
         role = getattr(principal, "role", None)
         if role not in EXPORT_ROLES:
             # Not a 404: the caller is authenticated and the route exists — they
@@ -118,7 +119,7 @@ class ExportService:
             "total": None,
             "filters": filters,
             # Resolved now, while we still hold the caller's token.
-            "groupNames": self._group_names(bearer_token=bearer_token),
+            "groupNames": self._group_names(bearer_token=bearer_token, claim_headers=claim_headers),
             "fileName": file_name,
             "fileKey": f"members/{job_id}.csv",
             "error": None,
@@ -146,7 +147,7 @@ class ExportService:
 
         return self._public(job)
 
-    def _group_names(self, *, bearer_token: str | None) -> dict:
+    def _group_names(self, *, bearer_token: str | None, claim_headers: dict | None = None) -> dict:
         """id -> name for every group, for the CSV's `groups` column.
 
         Done here rather than in the worker because the fan-out forwards the
@@ -157,7 +158,8 @@ class ExportService:
         if self._fan_out is None:
             return {}
         try:
-            result = self._fan_out.fan_out({"groups": "/groups"}, bearer_token=bearer_token)
+            result = self._fan_out.fan_out({"groups": "/groups"}, bearer_token=bearer_token,
+                                           claim_headers=claim_headers)
             items = ((result or {}).get("groups") or {}).get("items") or []
         except Exception:  # noqa: BLE001 — degraded column beats a failed export
             log(_logger, 30, "group-name lookup failed; export will emit group ids")

@@ -31,6 +31,13 @@ Parameters:
   # to no encryption is exactly what this change exists to prevent.
   SqsKmsKeyArn: { Type: String }
   SqsKmsAccessPolicyArn: { Type: String }
+  # Application Signals (Track B). When 'true', the ADOT layer + exec wrapper +
+  # managed policy are attached so this service emits APM metrics/traces. Layer
+  # ARN is region+runtime specific and supplied by the operator.
+  EnableApplicationSignals: { Type: String, Default: 'false', AllowedValues: ['true', 'false'] }
+  AppSignalsLayerArn: { Type: String, Default: 'arn:aws:lambda:us-east-1:000000000000:layer:SET_APP_SIGNALS_LAYER_ARN:1' }
+Conditions:
+  AppSignalsEnabled: !Equals [ !Ref EnableApplicationSignals, 'true' ]
 Globals:
   Function:
     Runtime: python3.12
@@ -49,13 +56,22 @@ Resources:
       FunctionName: !Sub "forums-${Stage}"
       Handler: app.handler
       CodeUri: ../../dist/forums.zip
+      # Application Signals ADOT layer (Track B) — attached only when enabled.
+      Layers: !If [ AppSignalsEnabled, [ !Ref AppSignalsLayerArn ], !Ref "AWS::NoValue" ]
       VpcConfig:
         SubnetIds: !Ref PrivateSubnetIds
         SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
       Environment:
         Variables:
+          # Application Signals auto-instrumentation (Track B). Both omitted when
+          # disabled so the function starts normally without the ADOT layer.
+          AWS_LAMBDA_EXEC_WRAPPER: !If [ AppSignalsEnabled, "/opt/otel-instrument", !Ref "AWS::NoValue" ]
+          OTEL_SERVICE_NAME: !If [ AppSignalsEnabled, "forums", !Ref "AWS::NoValue" ]
           TABLE_NAME: !Ref TableName
           IDEMPOTENCY_TABLE: !Ref IdempotencyTableName
+          # Trust boundary for extract_claims: X-Claims-* internal headers are
+          # honored ONLY when the request arrives on the private API (apiId match).
+          PRIVATE_API_ID: !Ref PrivateRestApiId
           EVENT_BUS_NAME: !Ref EventBusName
           ENABLE_SEMANTIC_SEARCH: !Ref EnableSemanticSearch
           API_BASE_URL: !Ref ApiBaseUrl
@@ -65,6 +81,8 @@ Resources:
           RATE_LIMIT_REPLY_PER_HOUR: '30'
           MENTION_CAP: '25'
       Policies:
+        # Application Signals write access (Track B) — attached only when enabled.
+        - !If [ AppSignalsEnabled, "arn:aws:iam::aws:policy/CloudWatchLambdaApplicationSignalsExecutionRolePolicy", !Ref "AWS::NoValue" ]
         # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
         - !Ref DynamoDbKmsAccessPolicyArn
         - !Ref SqsKmsAccessPolicyArn

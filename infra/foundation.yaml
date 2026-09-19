@@ -9,6 +9,10 @@ Parameters:
   Stage: { Type: String, Default: dev, AllowedValues: [dev, prod] }
   OpsEmail: { Type: String, Description: Email subscribed to ops/security alarms }
   LogRetentionDays: { Type: Number, Default: 30 }
+  # Track B gate. When 'true', the X-Ray interface VPC endpoint below is created
+  # so Application Signals traces/spans can egress this no-internet VPC. Default
+  # 'false' keeps the endpoint out of environments not using tracing.
+  EnableApplicationSignals: { Type: String, Default: 'false', AllowedValues: ['true', 'false'] }
   # From the keys stack. The DynamoDB CMK lives there rather than here to break a
   # dependency cycle — see the note at the top of infra/keys.yaml.
   DynamoDbKmsAccessPolicyArn: { Type: String }
@@ -20,6 +24,14 @@ Parameters:
   # is the only consumer: it is a Cognito PreTokenGeneration trigger, so it cannot
   # move to the identity-access stack, which is why the value has to come to it.
   IdentityAccessTableName: { Type: String }
+
+Conditions:
+  # Track B: create the X-Ray interface endpoint only when Application Signals is
+  # on. Like the OpenSearch (aoss) endpoint, this condition-gated endpoint is
+  # intentionally NOT added to AzSelector's service list — xray is broadly
+  # available, but if a region offers it in fewer AZs than the always-on
+  # services, add it there.
+  CreateXRayEndpoint: !Equals [ !Ref EnableApplicationSignals, 'true' ]
 
 # NatPerAz / MultiNat are gone with the NAT Gateways (2026-08-30). They existed to
 # choose between one NAT and one-per-AZ; with no NAT at all there is nothing to
@@ -450,6 +462,21 @@ Resources:
     Properties:
       VpcId: !Ref Vpc
       ServiceName: !Sub "com.amazonaws.${AWS::Region}.states"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref VpcEndpointSecurityGroup]
+
+  # X-Ray interface endpoint (Track B). Without it, Application Signals /
+  # transaction-trace spans cannot leave this no-internet VPC, so the service
+  # map, SLOs and Transaction Search stay empty even with the Lambdas
+  # instrumented. Condition-gated so it costs nothing when tracing is off.
+  XRayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateXRayEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.xray"
       VpcEndpointType: Interface
       PrivateDnsEnabled: true
       SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]

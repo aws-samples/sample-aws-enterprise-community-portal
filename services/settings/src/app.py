@@ -22,7 +22,7 @@ import os
 import re
 import uuid
 
-from _conventions.authz import Principal
+from _conventions.authz import Principal, extract_claims
 from _conventions.errors import (
     AppError,
     ForbiddenError,
@@ -150,7 +150,7 @@ def _match(method: str, path: str):
 
 
 def _principal(event) -> Principal | None:
-    claims = (((event.get("requestContext") or {}).get("authorizer") or {}).get("claims")) or {}
+    claims = extract_claims(event)
     if not claims:
         return None
     return Principal.from_claims(claims)
@@ -171,7 +171,7 @@ def _actor_email(event) -> str:
     """The caller's `email` claim, denormalized onto new file-share slots so the
     Community Leader listing can render "Created By" without a per-row lookup.
     Cognito puts `email` on the ID token; absent for the local-admin path."""
-    claims = (((event.get("requestContext") or {}).get("authorizer") or {}).get("claims")) or {}
+    claims = extract_claims(event)
     email = claims.get("email") or ""
     return email.strip().lower() if isinstance(email, str) else ""
 

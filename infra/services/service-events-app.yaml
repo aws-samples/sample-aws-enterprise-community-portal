@@ -23,9 +23,16 @@ Parameters:
   FileShareBucketArn: { Type: String, Default: '' }
   LibraryTableName: { Type: String, Default: '' }
   LibraryTableArn: { Type: String, Default: '' }
+  LibraryStreamArn: { Type: String, Default: '', Description: "DynamoDB stream ARN of the Content Library table. Feeds the LibraryIndexerFn. Empty disables the indexer (search falls back to the DynamoDB GSI1 walk)." }
   ApiBaseUrl: { Type: String, Default: '' }
   PublicUploadBaseUrl: { Type: String, Default: '' }
   EnableSemanticSearch: { Type: String, Default: 'false' }
+  # OpenSearch Serverless (shared portal-search collection). The Content Library
+  # search path uses it exactly as the member directory does. The gate is the
+  # ENDPOINT being set, NOT EnableSemanticSearch — the collection is always on
+  # for members, and the library rides the same collection.
+  OpenSearchEndpoint: { Type: String, Default: '' }
+  OpenSearchCollectionArn: { Type: String, Default: '' }
   OpsAlarmTopicArn: { Type: String }
   PrivateSubnetIds: { Type: CommaDelimitedList }
   LambdaSecurityGroupId: { Type: String }
@@ -38,6 +45,17 @@ Parameters:
   # functions fails with a KMS AccessDenied once the key policy's wildcard
   # statement is removed.
   DynamoDbKmsAccessPolicyArn: { Type: String }
+  # SQS CMK + its use policy from the Keys stack, for the LibraryIndexer DLQ.
+  # Required (no Default), matching every other app stack: an empty KmsMasterKeyId
+  # is not valid, and a queue silently falling back to no encryption is exactly
+  # what this prevents. root-template always supplies both from the Keys stack.
+  SqsKmsKeyArn: { Type: String }
+  SqsKmsAccessPolicyArn: { Type: String }
+  # Application Signals (Track B). When 'true', the ADOT layer + exec wrapper +
+  # managed policy are attached so this service emits APM metrics/traces. Layer
+  # ARN is region+runtime specific and supplied by the operator.
+  EnableApplicationSignals: { Type: String, Default: 'false', AllowedValues: ['true', 'false'] }
+  AppSignalsLayerArn: { Type: String, Default: 'arn:aws:lambda:us-east-1:000000000000:layer:SET_APP_SIGNALS_LAYER_ARN:1' }
 
 Globals:
   Function:
@@ -48,6 +66,7 @@ Globals:
     Timeout: 60
     Tracing: Active
 Conditions:
+  AppSignalsEnabled: !Equals [ !Ref EnableApplicationSignals, 'true' ]
   HasBusArn: !Not [ !Equals [ !Ref EventBusArn, '' ] ]
   # Keyed on the Arn (not the Name) so cfn-lint's condition-aware resolution can
   # prove the Ref/Sub below never sees the empty default.
@@ -55,6 +74,14 @@ Conditions:
   HasTableArn: !Not [ !Equals [ !Ref TableArn, '' ] ]
   HasIdeasTable: !Not [ !Equals [ !Ref IdeasTableArn, '' ] ]
   HasLibraryTable: !Not [ !Equals [ !Ref LibraryTableArn, '' ] ]
+  # OpenSearch-backed library search + stream indexer. Keyed on the endpoint
+  # (not EnableSemanticSearch) — see the OpenSearchEndpoint parameter comment.
+  HasOpenSearch: !Not [ !Equals [ !Ref OpenSearchEndpoint, '' ] ]
+  # The indexer's DynamoDB event source needs BOTH a stream to read and an
+  # endpoint to write to.
+  HasLibraryStream: !And
+    - !Not [ !Equals [ !Ref LibraryStreamArn, '' ] ]
+    - !Condition HasOpenSearch
 Resources:
   Fn:
     Type: AWS::Serverless::Function
@@ -67,13 +94,22 @@ Resources:
       FunctionName: !Sub "events-${Stage}"
       Handler: app.handler            # REAL handler (replaces mock_handler.handler)
       CodeUri: ../../dist/events.zip
+      # Application Signals ADOT layer (Track B) — attached only when enabled.
+      Layers: !If [ AppSignalsEnabled, [ !Ref AppSignalsLayerArn ], !Ref "AWS::NoValue" ]
       VpcConfig:
         SubnetIds: !Ref PrivateSubnetIds
         SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
       Environment:
         Variables:
+          # Application Signals auto-instrumentation (Track B). Both omitted when
+          # disabled so the function starts normally without the ADOT layer.
+          AWS_LAMBDA_EXEC_WRAPPER: !If [ AppSignalsEnabled, "/opt/otel-instrument", !Ref "AWS::NoValue" ]
+          OTEL_SERVICE_NAME: !If [ AppSignalsEnabled, "events", !Ref "AWS::NoValue" ]
           TABLE_NAME: !Ref TableName
           IDEMPOTENCY_TABLE: !Ref IdempotencyTableName
+          # Trust boundary for extract_claims: X-Claims-* internal headers are
+          # honored ONLY when the request arrives on the private API (apiId match).
+          PRIVATE_API_ID: !Ref PrivateRestApiId
           EVENT_BUS_NAME: !Ref EventBusName
           FILE_SHARE_BUCKET: !Ref FileShareBucketName
           API_BASE_URL: !Ref ApiBaseUrl
@@ -81,7 +117,12 @@ Resources:
           ENABLE_SEMANTIC_SEARCH: !Ref EnableSemanticSearch
           IDEAS_TABLE_NAME: !Ref IdeasTableName
           LIBRARY_TABLE_NAME: !Ref LibraryTableName
+          # When set, LibraryService.search queries OpenSearch instead of walking
+          # the GSI1 partition. Empty string => fail-soft to the DynamoDB walk.
+          OPENSEARCH_ENDPOINT: !Ref OpenSearchEndpoint
       Policies:
+        # Application Signals write access (Track B) — attached only when enabled.
+        - !If [ AppSignalsEnabled, "arn:aws:iam::aws:policy/CloudWatchLambdaApplicationSignalsExecutionRolePolicy", !Ref "AWS::NoValue" ]
         # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
         - !Ref DynamoDbKmsAccessPolicyArn
         - Statement:
@@ -109,6 +150,9 @@ Resources:
                   - dynamodb:UpdateItem
                   - dynamodb:DeleteItem
                   - dynamodb:Query
+                  # Scan is used only by the library-reindex backfill path
+                  # (reindex_all bulk-indexes every resource into OpenSearch).
+                  - dynamodb:Scan
                 Resource:
                   - !Ref LibraryTableArn
                   - !Sub "${LibraryTableArn}/index/*"
@@ -151,6 +195,18 @@ Resources:
               Condition:
                 StringLike:
                   s3:prefix: [ "events/*", "library/*" ]
+        # OpenSearch read for the library search path (query only). The indexer
+        # (below) holds its own write grant. aoss has no finer-grained action
+        # than APIAccessAll; the data-access policy on the collection scopes it
+        # to the portal-search-${Stage}/* indexes.
+        - !If
+          - HasOpenSearch
+          - Statement:
+              - Sid: OpenSearchLibrarySearch
+                Effect: Allow
+                Action: aoss:APIAccessAll
+                Resource: !Ref OpenSearchCollectionArn
+          - !Ref AWS::NoValue
 
   # ---- branch 3: Identity & Access group soft-delete (BR-X3) ----------------
   GroupEventRule:
@@ -253,6 +309,105 @@ Resources:
       FunctionName: !Ref Fn
       Principal: events.amazonaws.com
       SourceArn: !GetAtt MalwareScanRule.Arn
+
+  # ---- Content Library OpenSearch stream indexer (US-2.20 search rework) ----
+  # Mirrors MemberIndexerFn: indexes RESOURCE#*/META items into the OpenSearch
+  # 'library' index on every write, applying the same Clean/Link visibility rule
+  # the sparse GSI1 key encodes. Separate function (same zip, different handler)
+  # so a stream backlog never occupies an interactive API container.
+  LibraryIndexerFn:
+    Type: AWS::Serverless::Function
+    Condition: HasLibraryStream
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "False positive — cfn_nag's SAM transform (cfn-model) drops VpcConfig; this function IS VPC-configured (see VpcConfig below)"
+    Properties:
+      FunctionName: !Sub "events-library-indexer-${Stage}"
+      Handler: library_indexer.handler
+      CodeUri: ../../dist/events.zip
+      # Application Signals ADOT layer (Track B) — attached only when enabled.
+      Layers: !If [ AppSignalsEnabled, [ !Ref AppSignalsLayerArn ], !Ref "AWS::NoValue" ]
+      Timeout: 60   # OpenSearch writes can take up to ~30s on cold start; 60s headroom
+      VpcConfig:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
+      ReservedConcurrentExecutions: 5
+      Environment:
+        Variables:
+          AWS_LAMBDA_EXEC_WRAPPER: !If [ AppSignalsEnabled, "/opt/otel-instrument", !Ref "AWS::NoValue" ]
+          OTEL_SERVICE_NAME: !If [ AppSignalsEnabled, "events", !Ref "AWS::NoValue" ]
+          OPENSEARCH_ENDPOINT: !Ref OpenSearchEndpoint
+      Policies:
+        - !If [ AppSignalsEnabled, "arn:aws:iam::aws:policy/CloudWatchLambdaApplicationSignalsExecutionRolePolicy", !Ref "AWS::NoValue" ]
+        # DynamoDB CMK use — the stream records are encrypted with the table CMK.
+        - !Ref DynamoDbKmsAccessPolicyArn
+        - !Ref SqsKmsAccessPolicyArn
+        - Statement:
+            - Sid: OpenSearchIndexWrite
+              Effect: Allow
+              Action: aoss:APIAccessAll
+              Resource: !Ref OpenSearchCollectionArn
+        - SQSSendMessagePolicy: { QueueName: !GetAtt LibraryIndexerDLQ.QueueName }
+      Events:
+        LibraryStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !Ref LibraryStreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 100
+            MaximumRetryAttempts: 10
+            BisectBatchOnFunctionError: true
+            DestinationConfig:
+              OnFailure: { Destination: !GetAtt LibraryIndexerDLQ.Arn }
+
+  # SSE-KMS with the shared SQS CMK (Keys stack). KmsMasterKeyId (not
+  # SqsManagedSseEnabled — mutually exclusive) so Checkov CKV_AWS_27 and cfn_nag
+  # W48 pass. Written by the indexer's event-source mapping under its own role.
+  LibraryIndexerDLQ:
+    Type: AWS::SQS::Queue
+    Condition: HasLibraryStream
+    Properties:
+      KmsMasterKeyId: !Ref SqsKmsKeyArn
+      KmsDataKeyReusePeriodSeconds: 86400
+      MessageRetentionPeriod: 1209600   # 14 days
+
+  LibraryIndexerDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasLibraryStream
+    Properties:
+      AlarmDescription: >-
+        Library stream records landed in the indexer DLQ — resources are written
+        to DynamoDB but not reflected in OpenSearch search results.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [ { Name: QueueName, Value: !GetAtt LibraryIndexerDLQ.QueueName } ]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+
+  LibraryIndexerLagAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasLibraryStream
+    Properties:
+      AlarmDescription: >-
+        Library indexer is falling behind the stream (>5 min) — search results
+        are stale relative to DynamoDB writes.
+      Namespace: AWS/Lambda
+      MetricName: IteratorAge
+      Dimensions: [ { Name: FunctionName, Value: !Ref LibraryIndexerFn } ]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 300000   # 5 minutes
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
 
   # ---- alarms (P-OBS-1) ----------------------------------------------------
   # Beyond the first two, these cover conditions where the API looks healthy to

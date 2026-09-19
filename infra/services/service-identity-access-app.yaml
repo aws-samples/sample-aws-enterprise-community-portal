@@ -45,8 +45,14 @@ Parameters:
   SqsKmsAccessPolicyArn: { Type: String }
   UserExportBucketName: { Type: String, Default: '', Description: "Dedicated bucket for generated admin CSV exports (Foundation output). Empty disables the export worker." }
   UserExportBucketArn: { Type: String, Default: '', Description: "ARN of the same bucket. Conditions key off the ARN, not the name, because an empty name still yields a valid-looking Sub." }
+  # Application Signals (Track B). When 'true', the ADOT layer + exec wrapper +
+  # managed policy are attached so this service emits APM metrics/traces. Layer
+  # ARN is region+runtime specific and supplied by the operator.
+  EnableApplicationSignals: { Type: String, Default: 'false', AllowedValues: ['true', 'false'] }
+  AppSignalsLayerArn: { Type: String, Default: 'arn:aws:lambda:us-east-1:000000000000:layer:SET_APP_SIGNALS_LAYER_ARN:1' }
 
 Conditions:
+  AppSignalsEnabled: !Equals [ !Ref EnableApplicationSignals, 'true' ]
   HasUserPool: !Not [ !Equals [ !Ref UserPoolArn, '' ] ]
   HasBusArn: !Not [ !Equals [ !Ref EventBusArn, '' ] ]
   HasSesArn: !Not [ !Equals [ !Ref SesSenderArn, '' ] ]
@@ -77,6 +83,8 @@ Resources:
       FunctionName: !Sub "identity-access-${Stage}"
       Handler: app.handler
       CodeUri: ../../dist/identity-access.zip
+      # Application Signals ADOT layer (Track B) — attached only when enabled.
+      Layers: !If [ AppSignalsEnabled, [ !Ref AppSignalsLayerArn ], !Ref "AWS::NoValue" ]
       VpcConfig:
         SubnetIds: !Ref PrivateSubnetIds
         SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
@@ -86,8 +94,15 @@ Resources:
         ProvisionedConcurrentExecutions: 1
       Environment:
         Variables:
+          # Application Signals auto-instrumentation (Track B). Both omitted when
+          # disabled so the function starts normally without the ADOT layer.
+          AWS_LAMBDA_EXEC_WRAPPER: !If [ AppSignalsEnabled, "/opt/otel-instrument", !Ref "AWS::NoValue" ]
+          OTEL_SERVICE_NAME: !If [ AppSignalsEnabled, "identity-access", !Ref "AWS::NoValue" ]
           TABLE_NAME: !Ref TableName
           IDEMPOTENCY_TABLE: !Ref IdempotencyTableName
+          # Trust boundary for extract_claims: X-Claims-* internal headers are
+          # honored ONLY when the request arrives on the private API (apiId match).
+          PRIVATE_API_ID: !Ref PrivateRestApiId
           EVENT_BUS_NAME: !Ref EventBusName
           USER_POOL_ID: !Ref UserPoolId
           USER_POOL_CLIENT_ID: !Ref UserPoolClientId
@@ -101,6 +116,8 @@ Resources:
           USER_EXPORT_BUCKET: !Ref UserExportBucketName
           EXPORT_WORKER_FUNCTION: !Sub "identity-access-user-export-${Stage}"
       Policies:
+        # Application Signals write access (Track B) — attached only when enabled.
+        - !If [ AppSignalsEnabled, "arn:aws:iam::aws:policy/CloudWatchLambdaApplicationSignalsExecutionRolePolicy", !Ref "AWS::NoValue" ]
         # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
         - !Ref DynamoDbKmsAccessPolicyArn
         - !Ref SqsKmsAccessPolicyArn
@@ -172,6 +189,62 @@ Resources:
                   - !Sub "${UserExportBucketArn}/groups/*"
           - !Ref AWS::NoValue
 
+  # --------------------------------------------------------- Claims edge authorizer
+  # REQUEST Lambda authorizer for the PUBLIC API (wired in api-edge.yaml, TTL=0).
+  # Verifies the Cognito ID token and injects the caller's FRESH claims (read from
+  # the CLAIMS projection item) into the request context, so services trust those
+  # instead of a stale JWT / a per-request membership fan-out. Identity-owned.
+  # In-VPC (JWKS-over-VPCE verified, design §7). Separate tiny zip = lean cold start.
+  # NOT YET WIRED: no AWS::Lambda::Permission for API Gateway here — that is added
+  # with the authorizer wiring (rollout step 5).
+  ClaimsAuthorizerFn:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "False positive — cfn_nag's SAM transform drops VpcConfig; this function IS VPC-configured (see VpcConfig below)"
+    Properties:
+      FunctionName: !Sub "claims-authorizer-${Stage}"
+      Handler: handler.handler
+      CodeUri: ../../dist/claims-authorizer.zip
+      MemorySize: 256
+      Timeout: 10
+      Layers: !If [ AppSignalsEnabled, [ !Ref AppSignalsLayerArn ], !Ref "AWS::NoValue" ]
+      VpcConfig:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
+      Environment:
+        Variables:
+          AWS_LAMBDA_EXEC_WRAPPER: !If [ AppSignalsEnabled, "/opt/otel-instrument", !Ref "AWS::NoValue" ]
+          OTEL_SERVICE_NAME: !If [ AppSignalsEnabled, "claims-authorizer", !Ref "AWS::NoValue" ]
+          IDENTITY_TABLE: !Ref TableName
+          USER_POOL_ID: !Ref UserPoolId
+          USER_POOL_CLIENT_ID: !Ref UserPoolClientId
+      Policies:
+        - !If [ AppSignalsEnabled, "arn:aws:iam::aws:policy/CloudWatchLambdaApplicationSignalsExecutionRolePolicy", !Ref "AWS::NoValue" ]
+        # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
+        - !Ref DynamoDbKmsAccessPolicyArn
+        # Least privilege: read ONLY the CLAIMS item on the base table. No index,
+        # no writes, no other tables.
+        - Statement:
+            - Sid: ReadMemberClaims
+              Effect: Allow
+              Action: dynamodb:GetItem
+              Resource: !Ref TableArn
+
+  # Allow the PUBLIC API Gateway to invoke the edge authorizer. SourceArn pins it
+  # to this account's public REST API (RestApiId param, from the ApiEdge stack) —
+  # the authorizer is wired on the public API only (the private API has no
+  # authorizer). /authorizers/* is the resource shape for a REQUEST authorizer.
+  ClaimsAuthorizerApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ClaimsAuthorizerFn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApiId}/authorizers/*"
+
   # ----------------------------------------------------------------- Stream indexer Lambda
   # Partially updates identity fields (name, email, role, status) in the shared
   # 'members' OpenSearch index when USER#*/PROFILE items change in DynamoDB.
@@ -189,6 +262,8 @@ Resources:
       FunctionName: !Sub "identity-access-user-indexer-${Stage}"
       Handler: indexer.handler
       CodeUri: ../../dist/identity-access.zip
+      # Application Signals ADOT layer (Track B) — attached only when enabled.
+      Layers: !If [ AppSignalsEnabled, [ !Ref AppSignalsLayerArn ], !Ref "AWS::NoValue" ]
       VpcConfig:
         SubnetIds: !Ref PrivateSubnetIds
         SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
@@ -197,8 +272,14 @@ Resources:
       ReservedConcurrentExecutions: 5
       Environment:
         Variables:
+          # Application Signals auto-instrumentation (Track B). Both omitted when
+          # disabled so the function starts normally without the ADOT layer.
+          AWS_LAMBDA_EXEC_WRAPPER: !If [ AppSignalsEnabled, "/opt/otel-instrument", !Ref "AWS::NoValue" ]
+          OTEL_SERVICE_NAME: !If [ AppSignalsEnabled, "identity-access", !Ref "AWS::NoValue" ]
           OPENSEARCH_ENDPOINT: !Ref OpenSearchEndpoint
       Policies:
+        # Application Signals write access (Track B) — attached only when enabled.
+        - !If [ AppSignalsEnabled, "arn:aws:iam::aws:policy/CloudWatchLambdaApplicationSignalsExecutionRolePolicy", !Ref "AWS::NoValue" ]
         # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
         - !Ref DynamoDbKmsAccessPolicyArn
         - !Ref SqsKmsAccessPolicyArn
@@ -240,6 +321,8 @@ Resources:
       FunctionName: !Sub "identity-access-user-export-${Stage}"
       Handler: export_worker.handler
       CodeUri: ../../dist/identity-access.zip
+      # Application Signals ADOT layer (Track B) — attached only when enabled.
+      Layers: !If [ AppSignalsEnabled, [ !Ref AppSignalsLayerArn ], !Ref "AWS::NoValue" ]
       VpcConfig:
         SubnetIds: !Ref PrivateSubnetIds
         SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
@@ -254,6 +337,10 @@ Resources:
       Timeout: 900
       Environment:
         Variables:
+          # Application Signals auto-instrumentation (Track B). Both omitted when
+          # disabled so the function starts normally without the ADOT layer.
+          AWS_LAMBDA_EXEC_WRAPPER: !If [ AppSignalsEnabled, "/opt/otel-instrument", !Ref "AWS::NoValue" ]
+          OTEL_SERVICE_NAME: !If [ AppSignalsEnabled, "identity-access", !Ref "AWS::NoValue" ]
           TABLE_NAME: !Ref TableName
           USER_EXPORT_BUCKET: !Ref UserExportBucketName
           OPENSEARCH_ENDPOINT: !Ref OpenSearchEndpoint
@@ -264,6 +351,8 @@ Resources:
       EventInvokeConfig:
         MaximumRetryAttempts: 0
       Policies:
+        # Application Signals write access (Track B) — attached only when enabled.
+        - !If [ AppSignalsEnabled, "arn:aws:iam::aws:policy/CloudWatchLambdaApplicationSignalsExecutionRolePolicy", !Ref "AWS::NoValue" ]
         # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
         - !Ref DynamoDbKmsAccessPolicyArn
         - !Ref SqsKmsAccessPolicyArn

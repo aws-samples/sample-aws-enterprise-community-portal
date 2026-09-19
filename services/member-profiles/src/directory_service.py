@@ -1,11 +1,12 @@
 """DirectoryService — browseDirectory (US-3.4/3.5) backed by OpenSearch.
 
 Keyword search, role/group/cert filters, and all column sorts are handled by
-OpenSearch. The DynamoDB scan/GSI fallback has been removed — OpenSearch is the
-only read path for the paged directory listing.
-
-CSV export (no limit/cursor) uses DynamoDB scan directly so it is authoritative
-and not subject to OpenSearch indexing lag.
+OpenSearch, which is the ONLY read path. `browse()` always issues a single paged
+query (limit defaults to 25); there is no DynamoDB-scan branch — omitting the
+limit returns the first page, never a full-table scan. (An earlier "no limit =
+unpaged CSV export scan" branch was removed: it was dead code, because the CSV
+export walks all pages through its own `search_members` loop in export_worker,
+not this method — see F1 perf fix.)
 
 Cert filter still requires a fan-out to Certifications (to get the set of
 holder IDs) but that result is pushed as a terms filter into the OpenSearch
@@ -72,6 +73,7 @@ class DirectoryService:
         sort: str = "firstName",
         sort_dir: str = "asc",
         bearer_token: str | None = None,
+        claim_headers: dict | None = None,
     ) -> dict:
         """Directory listing, group-scoped for the Member role.
 
@@ -116,44 +118,18 @@ class DirectoryService:
         if cert_id:
             result = self._fan_out.fan_out(
                 {"certifications": f"/certifications/claims?certId={cert_id}&status=Approved"},
-                bearer_token=bearer_token,
+                bearer_token=bearer_token, claim_headers=claim_headers,
             )
             holder_ids = {
                 c.get("memberId")
                 for c in (result.get("certifications") or {}).get("items", [])
             }
 
-        if not limit and not cursor:
-            # No pagination requested — full listing for CSV export.
-            # DynamoDB scan is authoritative; OpenSearch lag does not affect exports.
-            items = self._repo.all_profiles()
-            if role:
-                items = [i for i in items if i.get("role") == role]
-            if group_id:
-                items = [i for i in items
-                         if group_id in {g.get("groupId") for g in i.get("groups", [])}]
-            if scope is not None:
-                # Same scope rule as the paged path, applied against the profile's
-                # own denormalised `groups` array (the event consumer keeps it in
-                # step with identity-access). This branch is unreachable over HTTP
-                # today — app.py always supplies a limit, defaulting to 25 — but it
-                # is a public method and the previous version of this code was
-                # unscoped in BOTH branches, so leaving one of them open would
-                # reintroduce the bug the moment a caller omitted `limit`.
-                allowed = set(scope)
-                items = [i for i in items
-                         if allowed & {g.get("groupId") for g in i.get("groups", [])}]
-            if holder_ids is not None:
-                items = [i for i in items if i.get("id") in holder_ids]
-            if q:
-                kw = q.lower()
-                items = [i for i in items if kw in " ".join([
-                    i.get("firstName", ""), i.get("lastName", ""),
-                    i.get("email", ""), " ".join(i.get("skills", [])),
-                ]).lower()]
-            return listing(items, _row_serializer(principal))
-
-        # Paged OpenSearch query.
+        # Always served by OpenSearch — one paged query. There is no DynamoDB
+        # scan path: the interactive listing is a single page (default 25), and
+        # the CSV export walks ALL pages via its own `search_members` loop in
+        # export_worker (not this method). `limit` defaults to 25 so a caller
+        # that omits it gets the first page, never a full-table scan.
         items_raw, next_cursor = self._repo.search_members(
             q=q,
             role=role,

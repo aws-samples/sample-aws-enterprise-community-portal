@@ -21,6 +21,7 @@ import re
 from _conventions.errors import AppError, global_handler, to_response
 from _conventions.idempotency import IdempotencyStore
 from _conventions.logger import set_correlation_id
+from _conventions.authz import extract_claims
 from authz import Principal, check, load_authorizer
 from claim_service import ClaimService
 from consumers import MembershipConsumer, ScanVerdictConsumer
@@ -125,7 +126,7 @@ def _match(method: str, path: str):
 
 
 def _principal(event) -> Principal | None:
-    claims = (((event.get("requestContext") or {}).get("authorizer") or {}).get("claims")) or {}
+    claims = extract_claims(event)
     if not claims:
         return None
     principal = Principal.from_claims(claims)

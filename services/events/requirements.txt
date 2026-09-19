@@ -9,5 +9,13 @@
 #                            CVEs and was deliberately removed from this repo)
 #   tokens                -> secrets + hashlib + hmac
 #   cross-service reads   -> urllib + ThreadPoolExecutor
+#
+# OpenSearch-backed Content Library search (Unit 4) — the library search path
+# moved off a DynamoDB GSI1 full-partition walk (O(N) predicate scan, ~6 s at
+# 5k+ resources) onto the shared portal-search OpenSearch Serverless collection,
+# mirroring the member-profiles directory. These two pins match
+# services/member-profiles/requirements.txt exactly.
 boto3==1.34.162
 aws-lambda-powertools==2.43.1
+opensearch-py==2.4.2
+requests-aws4auth==1.3.1

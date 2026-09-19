@@ -17,7 +17,7 @@ import json
 import os
 import re
 
-from _conventions.authz import Principal
+from _conventions.authz import Principal, extract_claims
 from _conventions.errors import AppError, UnauthorizedError, global_handler, to_response
 from _conventions.idempotency import IdempotencyStore
 from _conventions.logger import set_correlation_id
@@ -32,7 +32,6 @@ from consumers import (
 )
 from export_service import ExportService
 from framework_service import FrameworkService
-from membership_client import MembershipClient
 from providers import EventPublisher, ExportStorage, Metrics
 from read_service import ReadService
 from repository import ContributionsRepository
@@ -98,7 +97,7 @@ def _no_content():
 
 class Context:
     def __init__(self, table=None, idempotency_table=None, events=None, metrics=None,
-                 membership_client=None, export_storage=None, lambda_client=None):
+                 export_storage=None, lambda_client=None):
         if table is None:
             import boto3
             table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
@@ -107,7 +106,6 @@ class Context:
         self.idempotency = IdempotencyStore(idem) if idem else None
         self.metrics = metrics or Metrics()
         self.events = events or EventPublisher(metrics=self.metrics)
-        self.membership = membership_client or MembershipClient()
 
         self.framework = FrameworkService(self.repo, self.events)
         self.scoring = ScoringService(self.repo, self.framework, self.events)
@@ -140,21 +138,13 @@ def _match(method, path):
 
 
 def _principal(event):
-    claims = (((event.get("requestContext") or {}).get("authorizer") or {}).get("claims")) or {}
+    claims = extract_claims(event)
     if not claims:
         raise UnauthorizedError()
     p = Principal.from_claims(claims)
     p.name = " ".join(x for x in (claims.get("given_name", "").strip(),
                                   claims.get("family_name", "").strip()) if x)
     return p
-
-
-def _bearer_token(event) -> str | None:
-    headers = event.get("headers") or {}
-    auth = headers.get("Authorization") or headers.get("authorization")
-    if auth and auth.lower().startswith("bearer "):
-        return auth[7:]
-    return auth
 
 
 def dispatch_http(event, ctx):
@@ -172,15 +162,8 @@ def dispatch_http(event, ctx):
     qs = event.get("queryStringParameters") or {}
     try:
         p = _principal(event)
-        # Refresh stale JWT member_group_ids for Member operations.
-        # The JWT is baked at login — groups joined mid-session are not
-        # reflected until re-login. A live DB lookup fixes this fail-soft.
-        if p.role == "Member":
-            token = _bearer_token(event)
-            if token:
-                live_groups = ctx.membership.get_member_group_ids(token)
-                if live_groups is not None:
-                    p.member_group_ids = live_groups
+        # member_group_ids are provided fresh by the edge claims authorizer on
+        # every request (fresh-claims-at-the-edge); no live refresh is needed.
         return _execute(ctx, op, params, body, qs, p)
     except AppError as err:
         return _resp(err.status, {"code": err.code, "message": err.message,
@@ -249,10 +232,27 @@ def _execute(ctx, op, params, body, qs, p):
 
 # ---------------------------------------------------------------- entrypoints
 
+# Module-level Context singleton, reused across warm Lambda invocations.
+# Building a fresh Context per request threw away FrameworkService's warm-container
+# cache (and rebuilt the boto3 resource, idempotency store, and clients every
+# time), so every getFramework re-ran three sequential DynamoDB queries (~1160ms).
+# The cache still invalidates correctly on CL writes via FrameworkService._bust();
+# the 60s TTL bounds staleness across other warm containers. Lazily initialized so
+# cold-start env/resource setup happens on first invocation, matching prior timing.
+_CONTEXT = None
+
+
+def _context():
+    global _CONTEXT
+    if _CONTEXT is None:
+        _CONTEXT = Context()
+    return _CONTEXT
+
+
 @global_handler
 def api_handler(event, context):
     try:
-        return dispatch_http(event, Context())
+        return dispatch_http(event, _context())
     except AppError as err:
         return to_response(err)
 
@@ -269,7 +269,7 @@ def _sqs_records(event):
 def consumer_handler(event, context):
     """SQS: Forum / Certification / Identity domain events. Each SQS body is the
     EventBridge event; the domain envelope is under `detail`."""
-    ctx = Context()
+    ctx = _context()
     for msg in _sqs_records(event):
         env = msg.get("detail") or msg
         etype = env.get("type") or msg.get("detail-type") or ""
@@ -293,7 +293,7 @@ def consumer_handler(event, context):
 def award_worker_handler(event, context):
     """SQS: Events' per-earner award events (AttendanceRecorded / EventDelivered
     / EventOrganized), routed from EventBridge. Bounded reserved concurrency."""
-    ctx = Context()
+    ctx = _context()
     for record in _sqs_records(event):
         ctx.award_worker.handle(record)
     return {"ok": True}
@@ -302,14 +302,14 @@ def award_worker_handler(event, context):
 @global_handler
 def rollup_handler(event, context):
     """DynamoDB Stream (ledger) -> rollups (exactly-once, Q2=A′)."""
-    ctx = Context()
+    ctx = _context()
     return ctx.rollup.handle(event.get("Records", []))
 
 
 @global_handler
 def sweep_handler(event, context):
     """Nightly EventBridge Scheduler -> the four DL14 aggregates."""
-    ctx = Context()
+    ctx = _context()
     group_ids = event.get("groupIds") or []
     return ctx.sweep.run(group_ids=group_ids)
 

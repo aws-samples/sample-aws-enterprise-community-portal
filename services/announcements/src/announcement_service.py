@@ -12,6 +12,7 @@ from __future__ import annotations
 import uuid
 
 import models
+from _conventions.authz import claims_to_headers
 from _conventions.errors import ForbiddenError, NotFoundError
 from _conventions.logger import set_correlation_id
 from _conventions.validation import require_str
@@ -38,12 +39,15 @@ class AnnouncementService:
         self._require_author_role(principal)
         title = require_str(body.get("title"), "title", max_len=models.TITLE_MAX)
 
+        ch = claims_to_headers(principal)
+
         def _group_name(gid: str):
-            return self._directory.group_name(gid, bearer_token=bearer_token)
+            return self._directory.group_name(gid, bearer_token=bearer_token, claim_headers=ch)
 
         target, source = models.normalize_target(body, principal, group_name_lookup=_group_name)
         expires_at = models.resolve_expiry(body.get("expiresAt"))
-        author_name = self._directory.member_name(principal.user_id, bearer_token=bearer_token) \
+        author_name = self._directory.member_name(principal.user_id, bearer_token=bearer_token,
+                                                  claim_headers=ch) \
             or principal.user_id
         email_opt_in = bool(body.get("emailOptIn", False))
 
@@ -73,7 +77,8 @@ class AnnouncementService:
             item["body"] = normalize_body(body.get("body"))
         if "target" in body:
             def _group_name(gid: str):
-                return self._directory.group_name(gid, bearer_token=bearer_token)
+                return self._directory.group_name(gid, bearer_token=bearer_token,
+                                                  claim_headers=claims_to_headers(principal))
             target, source = models.normalize_target(body, principal, group_name_lookup=_group_name)
             item["targetScope"] = target["scope"]
             item["targetGroupIds"] = target["groupIds"]

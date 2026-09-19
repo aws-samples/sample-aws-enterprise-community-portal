@@ -1,0 +1,540 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Community Portal — Observability stack (Track A dashboards + performance
+  widgets + CloudFront additional metrics + DynamoDB size/PITR custom metrics +
+  optional KMS decrypt-error filter + Application Signals SLOs). OPT-IN: the
+  root template only nests this stack when EnableObservabilityDashboards=true,
+  so it adds no cost to environments that don't want it. It is a read-only
+  consumer of other stacks' metrics — nothing depends on it — so it is safe to
+  toggle on/off. See aidlc-docs/construction/observability/observability-design.md.
+
+Parameters:
+  Stage: { Type: String }
+  # When 'true', the Application Signals SLO resources are created (Track B).
+  # The dashboards themselves do not require it.
+  EnableApplicationSignals: { Type: String, Default: 'false', AllowedValues: ['true', 'false'] }
+  # SLOs are gated SEPARATELY (and default off) because they can only be created
+  # once Application Signals has DISCOVERED the services (i.e. after the
+  # instrumented functions have taken traffic). Creating them on a fresh stack
+  # would fail. Enable this in a follow-up deploy once services report + a
+  # baseline exists (see design 8.6). Requires EnableApplicationSignals=true too.
+  EnableSlos: { Type: String, Default: 'false', AllowedValues: ['true', 'false'] }
+  DistributionId: { Type: String, Description: CloudFront distribution id (from ApiEdge). }
+  PublicApiName: { Type: String, Description: AWS/ApiGateway ApiName dimension for the public REST API. }
+  OpsAlarmTopicArn: { Type: String, Description: SNS topic for the DynamoDB-metrics Lambda error alarm. }
+  LogsKmsKeyArn: { Type: String }
+  # OPTIONAL CloudTrail→CloudWatch Logs group for the KMS decrypt-error filter
+  # (Enablement E). KMS does not emit decrypt errors as native metrics, so the
+  # filter needs a CloudTrail log group. Left empty by default: this stack does
+  # NOT create a CloudTrail (account-level, cost-bearing). Supply the name of an
+  # existing CloudTrail log group to turn the KMS widget on.
+  CloudTrailLogGroupName: { Type: String, Default: '' }
+
+Conditions:
+  # SLOs require BOTH App Signals on AND the explicit SLO opt-in (services must
+  # be discovered first — see EnableSlos note above).
+  CreateSlos: !And [ !Equals [ !Ref EnableApplicationSignals, 'true' ], !Equals [ !Ref EnableSlos, 'true' ] ]
+  HasCloudTrail: !Not [ !Equals [ !Ref CloudTrailLogGroupName, '' ] ]
+
+Resources:
+
+  # ── Enablement A: CloudFront additional metrics ────────────────────────────
+  # Turns on cache-hit-rate, origin-latency and per-status-code error-rate
+  # metrics for the SPA distribution. Kept here (not in api-edge) so the cost is
+  # tied to the observability opt-in.
+  CloudFrontMonitoring:
+    Type: AWS::CloudFront::MonitoringSubscription
+    Properties:
+      DistributionId: !Ref DistributionId
+      MonitoringSubscription:
+        RealtimeMetricsSubscriptionConfig:
+          RealtimeMetricsSubscriptionStatus: Enabled
+
+  # ── DynamoDB size / item-count / PITR custom metrics (widgets 4.5 / 4.6) ────
+  # TableSizeBytes, ItemCount and PITR status are NOT native CloudWatch metrics;
+  # they come from DescribeTable / DescribeContinuousBackups. This scheduled
+  # Lambda publishes them to the Portal/DynamoDB namespace once an hour. Runs
+  # outside the VPC (AWS API calls only) to keep it simple and endpoint-free.
+  DynamoMetricsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: describe-and-publish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DescribeTables
+                Effect: Allow
+                Action: [ dynamodb:ListTables, dynamodb:DescribeTable, dynamodb:DescribeContinuousBackups ]
+                Resource: '*'
+              - Sid: PublishMetrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Condition: { StringEquals: { 'cloudwatch:namespace': 'Portal/DynamoDB' } }
+                Resource: '*'
+              - Sid: Logs
+                Effect: Allow
+                Action: [ logs:CreateLogStream, logs:PutLogEvents ]
+                Resource: !GetAtt DynamoMetricsLogGroup.Arn
+
+  DynamoMetricsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/observability-ddb-metrics-${Stage}"
+      RetentionInDays: 30
+      KmsKeyId: !Ref LogsKmsKeyArn
+
+  DynamoMetricsFn:
+    Type: AWS::Lambda::Function
+    # cfn_nag: this deliberately runs outside the VPC (control-plane AWS calls
+    # only, no customer data path) and needs no reserved concurrency.
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - { id: W89, reason: "Ops utility making only AWS control-plane calls; no VPC data path needed" }
+          - { id: W92, reason: "Hourly ops utility; reserved concurrency unnecessary" }
+    Properties:
+      FunctionName: !Sub "observability-ddb-metrics-${Stage}"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      MemorySize: 256
+      Role: !GetAtt DynamoMetricsRole.Arn
+      Environment:
+        Variables:
+          STAGE: !Ref Stage
+      Code:
+        ZipFile: |
+          import boto3, os
+          ddb = boto3.client("dynamodb")
+          cw = boto3.client("cloudwatch")
+          STAGE = os.environ.get("STAGE", "")
+
+          def handler(event, context):
+              paginator = ddb.get_paginator("list_tables")
+              names = []
+              for page in paginator.paginate():
+                  names.extend(page.get("TableNames", []))
+              # Only this stage's tables (names end with -<stage> or contain it).
+              if STAGE:
+                  names = [n for n in names if STAGE in n]
+              data = []
+              for name in names:
+                  try:
+                      d = ddb.describe_table(TableName=name)["Table"]
+                      dims = [{"Name": "TableName", "Value": name}]
+                      data.append({"MetricName": "TableSizeBytes", "Dimensions": dims,
+                                   "Value": float(d.get("TableSizeBytes", 0)), "Unit": "Bytes"})
+                      data.append({"MetricName": "ItemCount", "Dimensions": dims,
+                                   "Value": float(d.get("ItemCount", 0)), "Unit": "Count"})
+                      try:
+                          pitr = ddb.describe_continuous_backups(TableName=name)
+                          status = pitr["ContinuousBackupsDescription"]["PointInTimeRecoveryDescription"]["PointInTimeRecoveryStatus"]
+                          data.append({"MetricName": "PitrEnabled", "Dimensions": dims,
+                                       "Value": 1.0 if status == "ENABLED" else 0.0, "Unit": "Count"})
+                      except Exception:
+                          pass
+                  except Exception:
+                      continue
+              # PutMetricData accepts max 1000 metrics per call; chunk by 20.
+              for i in range(0, len(data), 20):
+                  cw.put_metric_data(Namespace="Portal/DynamoDB", MetricData=data[i:i + 20])
+              return {"tables": len(names), "metrics": len(data)}
+
+  DynamoMetricsSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "observability-ddb-metrics-${Stage}"
+      ScheduleExpression: rate(1 hour)
+      State: ENABLED
+      Targets:
+        - Id: ddb-metrics
+          Arn: !GetAtt DynamoMetricsFn.Arn
+
+  DynamoMetricsSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DynamoMetricsFn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DynamoMetricsSchedule.Arn
+
+  DynamoMetricsErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The DynamoDB size/PITR metrics publisher is failing; widgets 4.5/4.6 go stale.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [ { Name: FunctionName, Value: !Ref DynamoMetricsFn } ]
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+
+  # ── Enablement E: KMS decrypt-error metric filter (optional) ───────────────
+  # Only created when a CloudTrail log group is supplied. Emits Portal/KMS
+  # DecryptErrors from Decrypt/GenerateDataKey CloudTrail events that carry an
+  # errorCode. Without a CloudTrail data path this is skipped (see param note).
+  KmsDecryptErrorFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: HasCloudTrail
+    Properties:
+      LogGroupName: !Ref CloudTrailLogGroupName
+      FilterPattern: '{ ($.eventSource = "kms.amazonaws.com") && ($.errorCode = "*") && (($.eventName = "Decrypt") || ($.eventName = "GenerateDataKey")) }'
+      MetricTransformations:
+        - MetricNamespace: Portal/KMS
+          MetricName: DecryptErrors
+          MetricValue: '1'
+          DefaultValue: 0
+
+  # ── Application Signals SLOs (Track B) ─────────────────────────────────────
+  # Request-based availability SLOs per public-facing service. Only created when
+  # Application Signals is on (otherwise the metrics they read don't exist).
+  # Targets are STARTING POINTS — retune after a 2-4 week baseline (design 8.6).
+  SloIdentityAvailability:
+    Type: AWS::ApplicationSignals::ServiceLevelObjective
+    Condition: CreateSlos
+    Properties:
+      Name: !Sub "identity-access-availability-${Stage}"
+      Description: 99.9% successful requests over 28 days (starting target).
+      Goal:
+        AttainmentGoal: 99.9
+        WarningThreshold: 30
+        Interval:
+          RollingInterval: { Duration: 28, DurationUnit: DAY }
+      RequestBasedSli:
+        RequestBasedSliMetric:
+          KeyAttributes: { Type: Service, Name: identity-access, Environment: !Sub "lambda:${Stage}" }
+          MetricType: AVAILABILITY
+
+  SloEventsAvailability:
+    Type: AWS::ApplicationSignals::ServiceLevelObjective
+    Condition: CreateSlos
+    Properties:
+      Name: !Sub "events-availability-${Stage}"
+      Description: 99.5% successful requests over 28 days (starting target).
+      Goal:
+        AttainmentGoal: 99.5
+        WarningThreshold: 30
+        Interval:
+          RollingInterval: { Duration: 28, DurationUnit: DAY }
+      RequestBasedSli:
+        RequestBasedSliMetric:
+          KeyAttributes: { Type: Service, Name: events, Environment: !Sub "lambda:${Stage}" }
+          MetricType: AVAILABILITY
+
+  SloForumsAvailability:
+    Type: AWS::ApplicationSignals::ServiceLevelObjective
+    Condition: CreateSlos
+    Properties:
+      Name: !Sub "forums-availability-${Stage}"
+      Description: 99.5% successful requests over 28 days (starting target).
+      Goal:
+        AttainmentGoal: 99.5
+        WarningThreshold: 30
+        Interval:
+          RollingInterval: { Duration: 28, DurationUnit: DAY }
+      RequestBasedSli:
+        RequestBasedSliMetric:
+          KeyAttributes: { Type: Service, Name: forums, Environment: !Sub "lambda:${Stage}" }
+          MetricType: AVAILABILITY
+
+  SloMemberProfilesAvailability:
+    Type: AWS::ApplicationSignals::ServiceLevelObjective
+    Condition: CreateSlos
+    Properties:
+      Name: !Sub "member-profiles-availability-${Stage}"
+      Description: 99.5% successful requests over 28 days (starting target).
+      Goal:
+        AttainmentGoal: 99.5
+        WarningThreshold: 30
+        Interval:
+          RollingInterval: { Duration: 28, DurationUnit: DAY }
+      RequestBasedSli:
+        RequestBasedSliMetric:
+          KeyAttributes: { Type: Service, Name: member-profiles, Environment: !Sub "lambda:${Stage}" }
+          MetricType: AVAILABILITY
+
+  # ── Dashboard 1: Platform Health Overview ──────────────────────────────────
+  PlatformHealthDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "community-portal-health-${Stage}"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            { "type": "text", "x": 0, "y": 0, "width": 24, "height": 2,
+              "properties": { "markdown": "# Platform Health — ${Stage}\nFirst screen during an incident: is the site up, and where is the smoke? See per-service dashboard to drill in." } },
+            { "type": "metric", "x": 0, "y": 2, "width": 12, "height": 6,
+              "properties": { "title": "CloudFront traffic & errors", "region": "us-east-1", "view": "timeSeries", "stat": "Sum", "period": 300,
+                "metrics": [
+                  [ "AWS/CloudFront", "Requests", "DistributionId", "${DistributionId}", "Region", "Global", { "stat": "Sum" } ],
+                  [ "AWS/CloudFront", "4xxErrorRate", "DistributionId", "${DistributionId}", "Region", "Global", { "stat": "Average", "yAxis": "right" } ],
+                  [ "AWS/CloudFront", "5xxErrorRate", "DistributionId", "${DistributionId}", "Region", "Global", { "stat": "Average", "yAxis": "right" } ] ] } },
+            { "type": "metric", "x": 12, "y": 2, "width": 12, "height": 6,
+              "properties": { "title": "CloudFront cache & origin (Enablement A)", "region": "us-east-1", "view": "timeSeries", "period": 300,
+                "metrics": [
+                  [ "AWS/CloudFront", "CacheHitRate", "DistributionId", "${DistributionId}", "Region", "Global", { "stat": "Average" } ],
+                  [ "AWS/CloudFront", "OriginLatency", "DistributionId", "${DistributionId}", "Region", "Global", { "stat": "p95", "yAxis": "right" } ] ] } },
+            { "type": "metric", "x": 0, "y": 8, "width": 12, "height": 6,
+              "properties": { "title": "Public API volume & errors", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 300,
+                "metrics": [
+                  [ "AWS/ApiGateway", "Count", "ApiName", "${PublicApiName}", "Stage", "${Stage}", { "stat": "Sum" } ],
+                  [ "AWS/ApiGateway", "4XXError", "ApiName", "${PublicApiName}", "Stage", "${Stage}", { "stat": "Sum", "yAxis": "right" } ],
+                  [ "AWS/ApiGateway", "5XXError", "ApiName", "${PublicApiName}", "Stage", "${Stage}", { "stat": "Sum", "yAxis": "right" } ] ] } },
+            { "type": "metric", "x": 12, "y": 8, "width": 12, "height": 6,
+              "properties": { "title": "Public API latency (p50/p95/p99)", "region": "${AWS::Region}", "view": "timeSeries", "period": 300,
+                "metrics": [
+                  [ "AWS/ApiGateway", "Latency", "ApiName", "${PublicApiName}", "Stage", "${Stage}", { "stat": "p50" } ],
+                  [ "AWS/ApiGateway", "Latency", "ApiName", "${PublicApiName}", "Stage", "${Stage}", { "stat": "p95" } ],
+                  [ "AWS/ApiGateway", "Latency", "ApiName", "${PublicApiName}", "Stage", "${Stage}", { "stat": "p99" } ],
+                  [ "AWS/ApiGateway", "IntegrationLatency", "ApiName", "${PublicApiName}", "Stage", "${Stage}", { "stat": "p95", "yAxis": "right" } ] ] } },
+            { "type": "metric", "x": 0, "y": 14, "width": 12, "height": 6,
+              "properties": { "title": "Auth health (Cognito + custom)", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 300,
+                "metrics": [
+                  [ "Portal/IdentityAccess", "AuthFailures", { "stat": "Sum" } ],
+                  [ "Portal/IdentityAccess", "TokenClaimsFallbacks", { "stat": "Sum", "yAxis": "right" } ] ] } },
+            { "type": "metric", "x": 12, "y": 14, "width": 12, "height": 6,
+              "properties": { "title": "Lambda fleet: invocations / errors / throttles", "region": "${AWS::Region}", "view": "timeSeries", "period": 300,
+                "metrics": [
+                  [ { "expression": "SUM(SEARCH('{AWS/Lambda,FunctionName} MetricName=\"Invocations\"', 'Sum', 300))", "label": "Invocations", "id": "inv" } ],
+                  [ { "expression": "SUM(SEARCH('{AWS/Lambda,FunctionName} MetricName=\"Errors\"', 'Sum', 300))", "label": "Errors", "id": "err", "yAxis": "right" } ],
+                  [ { "expression": "SUM(SEARCH('{AWS/Lambda,FunctionName} MetricName=\"Throttles\"', 'Sum', 300))", "label": "Throttles", "id": "thr", "yAxis": "right" } ] ] } }
+          ]
+        }
+
+  # ── Dashboard 2: Per-Service Deep Dive (service-selectable) ─────────────────
+  PerServiceDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "community-portal-per-service-${Stage}"
+      DashboardBody: !Sub |
+        {
+          "variables": [
+            { "type": "property", "property": "FunctionName", "inputType": "select", "id": "fn", "label": "Service function",
+              "visible": true, "search": "AWS/Lambda MetricName=\"Errors\"", "populateFrom": "FunctionName" }
+          ],
+          "widgets": [
+            { "type": "text", "x": 0, "y": 0, "width": 24, "height": 2,
+              "properties": { "markdown": "# Per-Service Deep Dive — ${Stage}\nPick a function from the **FunctionName** selector above. Cold-start and memory widgets read the function's log group." } },
+            { "type": "metric", "x": 0, "y": 2, "width": 12, "height": 6,
+              "properties": { "title": "Invocations & errors", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 300,
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "events-${Stage}", { "stat": "Sum" } ],
+                  [ "AWS/Lambda", "Errors", "FunctionName", "events-${Stage}", { "stat": "Sum", "yAxis": "right" } ] ] } },
+            { "type": "metric", "x": 12, "y": 2, "width": 12, "height": 6,
+              "properties": { "title": "Throttles & concurrency", "region": "${AWS::Region}", "view": "timeSeries", "period": 300,
+                "metrics": [
+                  [ "AWS/Lambda", "Throttles", "FunctionName", "events-${Stage}", { "stat": "Sum" } ],
+                  [ "AWS/Lambda", "ConcurrentExecutions", "FunctionName", "events-${Stage}", { "stat": "Maximum", "yAxis": "right" } ] ] } },
+            { "type": "metric", "x": 0, "y": 8, "width": 12, "height": 6,
+              "properties": { "title": "Duration p50/p95/p99", "region": "${AWS::Region}", "view": "timeSeries", "period": 300,
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "events-${Stage}", { "stat": "p50" } ],
+                  [ "AWS/Lambda", "Duration", "FunctionName", "events-${Stage}", { "stat": "p95" } ],
+                  [ "AWS/Lambda", "Duration", "FunctionName", "events-${Stage}", { "stat": "p99" } ] ] } },
+            { "type": "log", "x": 12, "y": 8, "width": 12, "height": 6,
+              "properties": { "title": "Cold starts (init duration) — Enablement B", "region": "${AWS::Region}",
+                "query": "SOURCE logGroups(namePrefix: ['/aws/lambda/']) | filter ispresent(@initDuration) | stats count() as coldStarts, avg(@initDuration) as avgInitMs, pct(@initDuration, 99) as p99InitMs by bin(5m)",
+                "view": "table" } },
+            { "type": "log", "x": 0, "y": 14, "width": 12, "height": 6,
+              "properties": { "title": "Max memory used vs allocated", "region": "${AWS::Region}",
+                "query": "SOURCE logGroups(namePrefix: ['/aws/lambda/']) | filter ispresent(@maxMemoryUsed) | stats max(@maxMemoryUsed/1000000) as maxMemMB, max(@memorySize/1000000) as allocatedMB by bin(5m)",
+                "view": "table" } },
+            { "type": "metric", "x": 12, "y": 14, "width": 12, "height": 6,
+              "properties": { "title": "This service's Portal/* custom signals", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 300,
+                "metrics": [
+                  [ { "expression": "SUM(SEARCH('{Portal/Events} MetricName=\"LostDomainEvents\"', 'Sum', 300))", "label": "LostDomainEvents (example ns)", "id": "lde" } ] ] } }
+          ]
+        }
+
+  # ── Dashboard 3: Async / Event Plane ───────────────────────────────────────
+  AsyncEventPlaneDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "community-portal-async-${Stage}"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            { "type": "text", "x": 0, "y": 0, "width": 24, "height": 2,
+              "properties": { "markdown": "# Async / Event Plane — ${Stage}\nSilent event loss is the worst failure mode here. DLQ depth and LostDomainEvents must stay at zero." } },
+            { "type": "metric", "x": 0, "y": 2, "width": 12, "height": 6,
+              "properties": { "title": "EventBridge rules (triggered / failed / DLQ)", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 300,
+                "metrics": [
+                  [ { "expression": "SUM(SEARCH('{AWS/Events,RuleName} MetricName=\"TriggeredRules\"', 'Sum', 300))", "label": "TriggeredRules", "id": "tr" } ],
+                  [ { "expression": "SUM(SEARCH('{AWS/Events,RuleName} MetricName=\"FailedInvocations\"', 'Sum', 300))", "label": "FailedInvocations", "id": "fi", "yAxis": "right" } ],
+                  [ { "expression": "SUM(SEARCH('{AWS/Events,RuleName} MetricName=\"DeadLetterInvocations\"', 'Sum', 300))", "label": "DeadLetterInvocations", "id": "dli", "yAxis": "right" } ] ] } },
+            { "type": "metric", "x": 12, "y": 2, "width": 12, "height": 6,
+              "properties": { "title": "SQS backlog & oldest-message age", "region": "${AWS::Region}", "view": "timeSeries", "period": 300,
+                "metrics": [
+                  [ { "expression": "SUM(SEARCH('{AWS/SQS,QueueName} MetricName=\"ApproximateNumberOfMessagesVisible\"', 'Maximum', 300))", "label": "Visible", "id": "vis" } ],
+                  [ { "expression": "MAX(SEARCH('{AWS/SQS,QueueName} MetricName=\"ApproximateAgeOfOldestMessage\"', 'Maximum', 300))", "label": "OldestAge(s)", "id": "age", "yAxis": "right" } ] ] } },
+            { "type": "metric", "x": 0, "y": 8, "width": 12, "height": 6,
+              "properties": { "title": "DLQ depth per queue (must stay 0)", "region": "${AWS::Region}", "view": "timeSeries", "period": 300,
+                "metrics": [
+                  [ { "expression": "SEARCH('{AWS/SQS,QueueName} MetricName=\"ApproximateNumberOfMessagesVisible\" DLQ', 'Maximum', 300)", "label": "", "id": "dlq" } ] ] } },
+            { "type": "metric", "x": 12, "y": 8, "width": 12, "height": 6,
+              "properties": { "title": "LostDomainEvents (all services)", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 300,
+                "metrics": [
+                  [ { "expression": "SUM(SEARCH('MetricName=\"LostDomainEvents\"', 'Sum', 300))", "label": "LostDomainEvents", "id": "lde" } ] ] } },
+            { "type": "metric", "x": 0, "y": 14, "width": 12, "height": 6,
+              "properties": { "title": "Stream/consumer IteratorAge (CDC lag)", "region": "${AWS::Region}", "view": "timeSeries", "period": 300,
+                "metrics": [
+                  [ { "expression": "MAX(SEARCH('{AWS/Lambda,FunctionName} MetricName=\"IteratorAge\"', 'Maximum', 300))", "label": "Max IteratorAge(ms)", "id": "ia" } ] ] } },
+            { "type": "metric", "x": 12, "y": 14, "width": 12, "height": 6,
+              "properties": { "title": "Step Functions nightly jobs", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 300,
+                "metrics": [
+                  [ { "expression": "SUM(SEARCH('{AWS/States,StateMachineArn} MetricName=\"ExecutionsSucceeded\"', 'Sum', 300))", "label": "Succeeded", "id": "ss" } ],
+                  [ { "expression": "SUM(SEARCH('{AWS/States,StateMachineArn} MetricName=\"ExecutionsFailed\"', 'Sum', 300))", "label": "Failed", "id": "sf", "yAxis": "right" } ] ] } }
+          ]
+        }
+
+  # ── Dashboard 4: Data Integrity & Consistency ──────────────────────────────
+  DataIntegrityDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "community-portal-data-integrity-${Stage}"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            { "type": "text", "x": 0, "y": 0, "width": 24, "height": 2,
+              "properties": { "markdown": "# Data Integrity & Consistency — ${Stage}\nDegraded-but-200 and silent divergence signals. Any sustained non-zero line here means users are getting quietly-wrong data." } },
+            { "type": "metric", "x": 0, "y": 2, "width": 12, "height": 6,
+              "properties": { "title": "AuthzDegradations (all services)", "region": "${AWS::Region}", "view": "timeSeries", "period": 300,
+                "metrics": [
+                  [ { "expression": "SUM(SEARCH('MetricName=\"AuthzDegradations\"', 'Sum', 300))", "label": "AuthzDegradations", "id": "az" } ] ] } },
+            { "type": "metric", "x": 12, "y": 2, "width": 12, "height": 6,
+              "properties": { "title": "FanOutFailures + lookup fallbacks", "region": "${AWS::Region}", "view": "timeSeries", "period": 300,
+                "metrics": [
+                  [ { "expression": "SUM(SEARCH('MetricName=\"FanOutFailures\"', 'Sum', 300))", "label": "FanOutFailures", "id": "fo" } ],
+                  [ { "expression": "SUM(SEARCH('MetricName=\"DirectoryLookupFailures\"', 'Sum', 300))", "label": "DirectoryLookupFailures", "id": "dl", "yAxis": "right" } ],
+                  [ { "expression": "SUM(SEARCH('MetricName=\"GroupNameLookupFailures\"', 'Sum', 300))", "label": "GroupNameLookupFailures", "id": "gn", "yAxis": "right" } ] ] } },
+            { "type": "metric", "x": 0, "y": 8, "width": 12, "height": 6,
+              "properties": { "title": "DynamoDB ConditionalCheckFailedRequests", "region": "${AWS::Region}", "view": "timeSeries", "period": 300,
+                "metrics": [
+                  [ { "expression": "SUM(SEARCH('{AWS/DynamoDB,TableName} MetricName=\"ConditionalCheckFailedRequests\"', 'Sum', 300))", "label": "ConditionalCheckFailed", "id": "ccf" } ] ] } },
+            { "type": "metric", "x": 12, "y": 8, "width": 12, "height": 6,
+              "properties": { "title": "Table size (Portal/DynamoDB, hourly)", "region": "${AWS::Region}", "view": "timeSeries", "period": 3600,
+                "metrics": [
+                  [ { "expression": "SEARCH('{Portal/DynamoDB,TableName} MetricName=\"TableSizeBytes\"', 'Average', 3600)", "label": "", "id": "sz" } ] ] } },
+            { "type": "metric", "x": 0, "y": 14, "width": 24, "height": 4,
+              "properties": { "title": "PITR enabled per table (1=on, 0=off)", "region": "${AWS::Region}", "view": "timeSeries", "period": 3600,
+                "metrics": [
+                  [ { "expression": "SEARCH('{Portal/DynamoDB,TableName} MetricName=\"PitrEnabled\"', 'Minimum', 3600)", "label": "", "id": "pitr" } ] ] } }
+          ]
+        }
+
+  # ── Dashboard 5: Security & Compliance ──────────────────────────────────────
+  SecurityDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "community-portal-security-${Stage}"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            { "type": "text", "x": 0, "y": 0, "width": 24, "height": 2,
+              "properties": { "markdown": "# Security & Compliance — ${Stage}\nWAF is descoped, so CloudFront/API 4xx spikes are the main edge-abuse signal. KMS widget is empty unless a CloudTrail log group was supplied." } },
+            { "type": "metric", "x": 0, "y": 2, "width": 12, "height": 6,
+              "properties": { "title": "Auth failures (sign-in denials / OTP)", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 300,
+                "metrics": [ [ "Portal/IdentityAccess", "AuthFailures", { "stat": "Sum" } ] ] } },
+            { "type": "metric", "x": 12, "y": 2, "width": 12, "height": 6,
+              "properties": { "title": "Edge 4xx (CloudFront + API) — abuse proxy", "region": "${AWS::Region}", "view": "timeSeries", "period": 300,
+                "metrics": [
+                  [ "AWS/ApiGateway", "4XXError", "ApiName", "${PublicApiName}", "Stage", "${Stage}", { "stat": "Sum" } ],
+                  [ "AWS/CloudFront", "4xxErrorRate", "DistributionId", "${DistributionId}", "Region", "Global", { "stat": "Average", "yAxis": "right", "region": "us-east-1" } ] ] } },
+            { "type": "metric", "x": 0, "y": 8, "width": 12, "height": 6,
+              "properties": { "title": "Events: authz-probing 403s & malware", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 300,
+                "metrics": [
+                  [ { "expression": "SUM(SEARCH('MetricName=\"AuthorizationFailures\"', 'Sum', 300))", "label": "AuthorizationFailures", "id": "af" } ],
+                  [ { "expression": "SUM(SEARCH('MetricName=\"MalwareDetected\"', 'Sum', 300))", "label": "MalwareDetected", "id": "mw", "yAxis": "right" } ] ] } },
+            { "type": "metric", "x": 12, "y": 8, "width": 12, "height": 6,
+              "properties": { "title": "KMS decrypt errors (Enablement E, optional)", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 300,
+                "metrics": [ [ "Portal/KMS", "DecryptErrors", { "stat": "Sum" } ] ] } }
+          ]
+        }
+
+  # ── Dashboard 6: Cost & Capacity ────────────────────────────────────────────
+  CostCapacityDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "community-portal-cost-${Stage}"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            { "type": "text", "x": 0, "y": 0, "width": 24, "height": 2,
+              "properties": { "markdown": "# Cost & Capacity — ${Stage}\nWeekly-review cadence. GB-seconds approximates Lambda compute cost; DynamoDB consumed capacity flags runaway access patterns." } },
+            { "type": "metric", "x": 0, "y": 2, "width": 12, "height": 6,
+              "properties": { "title": "Lambda invocations (fleet)", "region": "${AWS::Region}", "view": "timeSeries", "period": 3600,
+                "metrics": [
+                  [ { "expression": "SUM(SEARCH('{AWS/Lambda,FunctionName} MetricName=\"Invocations\"', 'Sum', 3600))", "label": "Invocations/hr", "id": "inv" } ] ] } },
+            { "type": "metric", "x": 12, "y": 2, "width": 12, "height": 6,
+              "properties": { "title": "Lambda GB-seconds proxy (Duration sum)", "region": "${AWS::Region}", "view": "timeSeries", "period": 3600,
+                "metrics": [
+                  [ { "expression": "SUM(SEARCH('{AWS/Lambda,FunctionName} MetricName=\"Duration\"', 'Sum', 3600))/1000", "label": "Duration-seconds/hr", "id": "dur" } ] ] } },
+            { "type": "metric", "x": 0, "y": 8, "width": 12, "height": 6,
+              "properties": { "title": "DynamoDB consumed capacity", "region": "${AWS::Region}", "view": "timeSeries", "period": 3600,
+                "metrics": [
+                  [ { "expression": "SUM(SEARCH('{AWS/DynamoDB,TableName} MetricName=\"ConsumedReadCapacityUnits\"', 'Sum', 3600))", "label": "Read CU/hr", "id": "rcu" } ],
+                  [ { "expression": "SUM(SEARCH('{AWS/DynamoDB,TableName} MetricName=\"ConsumedWriteCapacityUnits\"', 'Sum', 3600))", "label": "Write CU/hr", "id": "wcu", "yAxis": "right" } ] ] } },
+            { "type": "metric", "x": 12, "y": 8, "width": 12, "height": 6,
+              "properties": { "title": "CloudFront data transfer out", "region": "us-east-1", "view": "timeSeries", "stat": "Sum", "period": 3600,
+                "metrics": [ [ "AWS/CloudFront", "BytesDownloaded", "DistributionId", "${DistributionId}", "Region", "Global", { "stat": "Sum" } ] ] } }
+          ]
+        }
+
+  # ── Dashboard 7: Load / Performance (perf-test view) ───────────────────────
+  # Fills the gaps a metric-only view leaves for a load test: the account
+  # concurrency ceiling, throttle breakdown, memory headroom, and a latency
+  # waterfall (API integration vs Lambda duration vs DynamoDB latency).
+  PerformanceDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "community-portal-performance-${Stage}"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            { "type": "text", "x": 0, "y": 0, "width": 24, "height": 3,
+              "properties": { "markdown": "# Load / Performance — ${Stage}\nPurpose-built for performance tests. **Concurrency ceiling** is the #1 serverless scaling wall (default account limit 1000). Watch throttles, memory headroom, and the latency waterfall to find the bottleneck hop. NOTE: dashboards do not generate load or capture client-side latency — use a load tool (k6/Gatling/Locust) alongside." } },
+            { "type": "metric", "x": 0, "y": 3, "width": 12, "height": 6,
+              "properties": { "title": "Fleet concurrency vs account limit (1000)", "region": "${AWS::Region}", "view": "timeSeries", "period": 60,
+                "yAxis": { "left": { "min": 0, "max": 1000 } },
+                "annotations": { "horizontal": [ { "label": "account limit", "value": 1000 }, { "label": "80% warn", "value": 800 } ] },
+                "metrics": [
+                  [ { "expression": "SUM(SEARCH('{AWS/Lambda,FunctionName} MetricName=\"ConcurrentExecutions\"', 'Maximum', 60))", "label": "Fleet ConcurrentExecutions", "id": "cc" } ] ] } },
+            { "type": "metric", "x": 12, "y": 3, "width": 12, "height": 6,
+              "properties": { "title": "Throttle breakdown (Lambda + API 429s)", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 60,
+                "metrics": [
+                  [ { "expression": "SUM(SEARCH('{AWS/Lambda,FunctionName} MetricName=\"Throttles\"', 'Sum', 60))", "label": "Lambda Throttles", "id": "lt" } ],
+                  [ "AWS/ApiGateway", "4XXError", "ApiName", "${PublicApiName}", "Stage", "${Stage}", { "stat": "Sum", "label": "API 4XX (incl 429 throttles)", "yAxis": "right" } ] ] } },
+            { "type": "metric", "x": 0, "y": 9, "width": 12, "height": 6,
+              "properties": { "title": "DynamoDB throttle events (burst ceiling)", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 60,
+                "metrics": [
+                  [ { "expression": "SUM(SEARCH('{AWS/DynamoDB,TableName} MetricName=\"ReadThrottleEvents\"', 'Sum', 60))", "label": "ReadThrottleEvents", "id": "rt" } ],
+                  [ { "expression": "SUM(SEARCH('{AWS/DynamoDB,TableName} MetricName=\"WriteThrottleEvents\"', 'Sum', 60))", "label": "WriteThrottleEvents", "id": "wt", "yAxis": "right" } ] ] } },
+            { "type": "log", "x": 12, "y": 9, "width": 12, "height": 6,
+              "properties": { "title": "Memory headroom (max used vs allocated MB)", "region": "${AWS::Region}",
+                "query": "SOURCE logGroups(namePrefix: ['/aws/lambda/']) | filter ispresent(@maxMemoryUsed) | stats max(@maxMemoryUsed/1000000) as maxUsedMB, max(@memorySize/1000000) as allocatedMB, max(@maxMemoryUsed/@memorySize)*100 as pctUsed by bin(1m)",
+                "view": "table" } },
+            { "type": "metric", "x": 0, "y": 15, "width": 24, "height": 6,
+              "properties": { "title": "Latency waterfall: API vs integration vs Lambda vs DynamoDB (p95)", "region": "${AWS::Region}", "view": "timeSeries", "period": 60,
+                "metrics": [
+                  [ "AWS/ApiGateway", "Latency", "ApiName", "${PublicApiName}", "Stage", "${Stage}", { "stat": "p95", "label": "API total p95" } ],
+                  [ "AWS/ApiGateway", "IntegrationLatency", "ApiName", "${PublicApiName}", "Stage", "${Stage}", { "stat": "p95", "label": "API integration p95" } ],
+                  [ { "expression": "MAX(SEARCH('{AWS/Lambda,FunctionName} MetricName=\"Duration\"', 'p95', 60))", "label": "Lambda duration p95 (worst fn)", "id": "ld" } ],
+                  [ { "expression": "MAX(SEARCH('{AWS/DynamoDB,TableName} MetricName=\"SuccessfulRequestLatency\"', 'Average', 60))", "label": "DynamoDB latency avg", "id": "dd" } ] ] } }
+          ]
+        }
+
+Outputs:
+  DashboardNames:
+    Description: The CloudWatch dashboards created by this stack.
+    Value: !Sub "community-portal-{health,per-service,async,data-integrity,security,cost,performance}-${Stage}"

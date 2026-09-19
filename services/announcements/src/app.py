@@ -14,7 +14,7 @@ import json
 import os
 import re
 
-from _conventions.authz import Principal
+from _conventions.authz import Principal, extract_claims
 from _conventions.errors import AppError, ForbiddenError, global_handler, to_response
 from _conventions.idempotency import IdempotencyStore
 from _conventions.logger import set_correlation_id
@@ -83,7 +83,7 @@ def _match(method: str, path: str):
 
 
 def _principal(event) -> Principal | None:
-    claims = (((event.get("requestContext") or {}).get("authorizer") or {}).get("claims")) or {}
+    claims = extract_claims(event)
     if not claims:
         return None
     return Principal.from_claims(claims)

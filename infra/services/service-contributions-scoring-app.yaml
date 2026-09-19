@@ -40,8 +40,14 @@ Parameters:
   SqsKmsAccessPolicyArn: { Type: String }
   UserExportBucketName: { Type: String, Default: '', Description: "Shared bucket for generated CSV exports (Foundation output). This service writes under the contributions/ prefix. Empty disables the export worker." }
   UserExportBucketArn: { Type: String, Default: '', Description: "ARN of the same bucket. Conditions key off the ARN, not the name, because an empty name still yields a valid-looking Sub." }
+  # Application Signals (Track B). When 'true', the ADOT layer + exec wrapper +
+  # managed policy are attached so this service emits APM metrics/traces. Layer
+  # ARN is region+runtime specific and supplied by the operator.
+  EnableApplicationSignals: { Type: String, Default: 'false', AllowedValues: ['true', 'false'] }
+  AppSignalsLayerArn: { Type: String, Default: 'arn:aws:lambda:us-east-1:000000000000:layer:SET_APP_SIGNALS_LAYER_ARN:1' }
 
 Conditions:
+  AppSignalsEnabled: !Equals [ !Ref EnableApplicationSignals, 'true' ]
   HasExportBucket: !Not [ !Equals [ !Ref UserExportBucketArn, '' ] ]
 
 Globals:
@@ -55,6 +61,9 @@ Globals:
       Variables:
         TABLE_NAME: !Ref TableName
         IDEMPOTENCY_TABLE: !Ref IdempotencyTableName
+        # Trust boundary for extract_claims: X-Claims-* internal headers are
+        # honored ONLY when the request arrives on the private API (apiId match).
+        PRIVATE_API_ID: !Ref PrivateRestApiId
         EVENT_BUS_NAME: !Ref EventBusName
         STAGE: !Ref Stage
 Resources:
@@ -136,17 +145,25 @@ Resources:
       FunctionName: !Sub "contributions-scoring-${Stage}"
       Handler: app.api_handler
       CodeUri: ../../dist/contributions-scoring.zip
+      # Application Signals ADOT layer (Track B) — attached only when enabled.
+      Layers: !If [ AppSignalsEnabled, [ !Ref AppSignalsLayerArn ], !Ref "AWS::NoValue" ]
       VpcConfig:
         SubnetIds: !Ref PrivateSubnetIds
         SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
       Environment:
         Variables:
+          # Application Signals auto-instrumentation (Track B). Both omitted when
+          # disabled so the function starts normally without the ADOT layer.
+          AWS_LAMBDA_EXEC_WRAPPER: !If [ AppSignalsEnabled, "/opt/otel-instrument", !Ref "AWS::NoValue" ]
+          OTEL_SERVICE_NAME: !If [ AppSignalsEnabled, "contributions-scoring", !Ref "AWS::NoValue" ]
           API_BASE_URL: !Ref ApiBaseUrl
           # Needed on the API function too: it mints the presigned download URL
           # when a finished export is collected (the worker writes the object).
           CONTRIBUTIONS_EXPORT_BUCKET: !Ref UserExportBucketName
           EXPORT_WORKER_FUNCTION: !Sub "contributions-export-${Stage}"
       Policies:
+        # Application Signals write access (Track B) — attached only when enabled.
+        - !If [ AppSignalsEnabled, "arn:aws:iam::aws:policy/CloudWatchLambdaApplicationSignalsExecutionRolePolicy", !Ref "AWS::NoValue" ]
         # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
         - !Ref DynamoDbKmsAccessPolicyArn
         - !Ref SqsKmsAccessPolicyArn
@@ -185,12 +202,22 @@ Resources:
       FunctionName: !Sub "contributions-consumer-${Stage}"
       Handler: app.consumer_handler
       CodeUri: ../../dist/contributions-scoring.zip
+      # Application Signals ADOT layer (Track B) — attached only when enabled.
+      Layers: !If [ AppSignalsEnabled, [ !Ref AppSignalsLayerArn ], !Ref "AWS::NoValue" ]
       VpcConfig:
         SubnetIds: !Ref PrivateSubnetIds
         SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
       Timeout: 60
       ReservedConcurrentExecutions: 10   # bounds a MembershipChanged storm (Q3)
+      Environment:
+        Variables:
+          # Application Signals auto-instrumentation (Track B). Both omitted when
+          # disabled so the function starts normally without the ADOT layer.
+          AWS_LAMBDA_EXEC_WRAPPER: !If [ AppSignalsEnabled, "/opt/otel-instrument", !Ref "AWS::NoValue" ]
+          OTEL_SERVICE_NAME: !If [ AppSignalsEnabled, "contributions-scoring", !Ref "AWS::NoValue" ]
       Policies:
+        # Application Signals write access (Track B) — attached only when enabled.
+        - !If [ AppSignalsEnabled, "arn:aws:iam::aws:policy/CloudWatchLambdaApplicationSignalsExecutionRolePolicy", !Ref "AWS::NoValue" ]
         # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
         - !Ref DynamoDbKmsAccessPolicyArn
         - !Ref SqsKmsAccessPolicyArn
@@ -214,11 +241,21 @@ Resources:
       FunctionName: !Sub "contributions-award-${Stage}"
       Handler: app.award_worker_handler
       CodeUri: ../../dist/contributions-scoring.zip
+      # Application Signals ADOT layer (Track B) — attached only when enabled.
+      Layers: !If [ AppSignalsEnabled, [ !Ref AppSignalsLayerArn ], !Ref "AWS::NoValue" ]
       VpcConfig:
         SubnetIds: !Ref PrivateSubnetIds
         SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
       ReservedConcurrentExecutions: 25   # paces DynamoDB; drains 1000 in ~2s (Q3)
+      Environment:
+        Variables:
+          # Application Signals auto-instrumentation (Track B). Both omitted when
+          # disabled so the function starts normally without the ADOT layer.
+          AWS_LAMBDA_EXEC_WRAPPER: !If [ AppSignalsEnabled, "/opt/otel-instrument", !Ref "AWS::NoValue" ]
+          OTEL_SERVICE_NAME: !If [ AppSignalsEnabled, "contributions-scoring", !Ref "AWS::NoValue" ]
       Policies:
+        # Application Signals write access (Track B) — attached only when enabled.
+        - !If [ AppSignalsEnabled, "arn:aws:iam::aws:policy/CloudWatchLambdaApplicationSignalsExecutionRolePolicy", !Ref "AWS::NoValue" ]
         # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
         - !Ref DynamoDbKmsAccessPolicyArn
         - !Ref SqsKmsAccessPolicyArn
@@ -241,11 +278,21 @@ Resources:
       FunctionName: !Sub "contributions-rollup-${Stage}"
       Handler: app.rollup_handler
       CodeUri: ../../dist/contributions-scoring.zip
+      # Application Signals ADOT layer (Track B) — attached only when enabled.
+      Layers: !If [ AppSignalsEnabled, [ !Ref AppSignalsLayerArn ], !Ref "AWS::NoValue" ]
       VpcConfig:
         SubnetIds: !Ref PrivateSubnetIds
         SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
       Timeout: 60
+      Environment:
+        Variables:
+          # Application Signals auto-instrumentation (Track B). Both omitted when
+          # disabled so the function starts normally without the ADOT layer.
+          AWS_LAMBDA_EXEC_WRAPPER: !If [ AppSignalsEnabled, "/opt/otel-instrument", !Ref "AWS::NoValue" ]
+          OTEL_SERVICE_NAME: !If [ AppSignalsEnabled, "contributions-scoring", !Ref "AWS::NoValue" ]
       Policies:
+        # Application Signals write access (Track B) — attached only when enabled.
+        - !If [ AppSignalsEnabled, "arn:aws:iam::aws:policy/CloudWatchLambdaApplicationSignalsExecutionRolePolicy", !Ref "AWS::NoValue" ]
         # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
         - !Ref DynamoDbKmsAccessPolicyArn
         - !Ref SqsKmsAccessPolicyArn
@@ -276,12 +323,22 @@ Resources:
       FunctionName: !Sub "contributions-sweep-${Stage}"
       Handler: app.sweep_handler
       CodeUri: ../../dist/contributions-scoring.zip
+      # Application Signals ADOT layer (Track B) — attached only when enabled.
+      Layers: !If [ AppSignalsEnabled, [ !Ref AppSignalsLayerArn ], !Ref "AWS::NoValue" ]
       VpcConfig:
         SubnetIds: !Ref PrivateSubnetIds
         SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
       MemorySize: 1024   # batch aggregate over the quarter's rollups
       Timeout: 300
+      Environment:
+        Variables:
+          # Application Signals auto-instrumentation (Track B). Both omitted when
+          # disabled so the function starts normally without the ADOT layer.
+          AWS_LAMBDA_EXEC_WRAPPER: !If [ AppSignalsEnabled, "/opt/otel-instrument", !Ref "AWS::NoValue" ]
+          OTEL_SERVICE_NAME: !If [ AppSignalsEnabled, "contributions-scoring", !Ref "AWS::NoValue" ]
       Policies:
+        # Application Signals write access (Track B) — attached only when enabled.
+        - !If [ AppSignalsEnabled, "arn:aws:iam::aws:policy/CloudWatchLambdaApplicationSignalsExecutionRolePolicy", !Ref "AWS::NoValue" ]
         # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
         - !Ref DynamoDbKmsAccessPolicyArn
         - !Ref SqsKmsAccessPolicyArn
@@ -309,6 +366,8 @@ Resources:
       FunctionName: !Sub "contributions-export-${Stage}"
       Handler: export_worker.handler
       CodeUri: ../../dist/contributions-scoring.zip
+      # Application Signals ADOT layer (Track B) — attached only when enabled.
+      Layers: !If [ AppSignalsEnabled, [ !Ref AppSignalsLayerArn ], !Ref "AWS::NoValue" ]
       VpcConfig:
         SubnetIds: !Ref PrivateSubnetIds
         SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
@@ -321,6 +380,10 @@ Resources:
       Timeout: 900
       Environment:
         Variables:
+          # Application Signals auto-instrumentation (Track B). Both omitted when
+          # disabled so the function starts normally without the ADOT layer.
+          AWS_LAMBDA_EXEC_WRAPPER: !If [ AppSignalsEnabled, "/opt/otel-instrument", !Ref "AWS::NoValue" ]
+          OTEL_SERVICE_NAME: !If [ AppSignalsEnabled, "contributions-scoring", !Ref "AWS::NoValue" ]
           CONTRIBUTIONS_EXPORT_BUCKET: !Ref UserExportBucketName
       # No retries. The handler catches its own failures, marks the job failed and
       # releases the per-actor lock, so a Lambda-level retry would re-run an export
@@ -329,6 +392,8 @@ Resources:
       EventInvokeConfig:
         MaximumRetryAttempts: 0
       Policies:
+        # Application Signals write access (Track B) — attached only when enabled.
+        - !If [ AppSignalsEnabled, "arn:aws:iam::aws:policy/CloudWatchLambdaApplicationSignalsExecutionRolePolicy", !Ref "AWS::NoValue" ]
         # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
         - !Ref DynamoDbKmsAccessPolicyArn
         - !Ref SqsKmsAccessPolicyArn

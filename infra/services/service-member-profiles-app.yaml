@@ -38,8 +38,14 @@ Parameters:
   SqsKmsAccessPolicyArn: { Type: String }
   UserExportBucketName: { Type: String, Default: '', Description: "Shared generated-exports bucket (Foundation output). This service writes only under the members/ prefix; identity-access owns users/. Empty disables the export worker." }
   UserExportBucketArn: { Type: String, Default: '', Description: "ARN of the same bucket. Conditions key off the ARN, not the name, because an empty name still yields a valid-looking Sub." }
+  # Application Signals (Track B). When 'true', the ADOT layer + exec wrapper +
+  # managed policy are attached so this service emits APM metrics/traces. Layer
+  # ARN is region+runtime specific and supplied by the operator.
+  EnableApplicationSignals: { Type: String, Default: 'false', AllowedValues: ['true', 'false'] }
+  AppSignalsLayerArn: { Type: String, Default: 'arn:aws:lambda:us-east-1:000000000000:layer:SET_APP_SIGNALS_LAYER_ARN:1' }
 
 Conditions:
+  AppSignalsEnabled: !Equals [ !Ref EnableApplicationSignals, 'true' ]
   HasBusArn: !Not [ !Equals [ !Ref EventBusArn, '' ] ]
   HasOpenSearch: !Not [ !Equals [ !Ref OpenSearchEndpoint, '' ] ]
   HasExportBucket: !Not [ !Equals [ !Ref UserExportBucketArn, '' ] ]
@@ -62,6 +68,8 @@ Resources:
       FunctionName: !Sub "member-profiles-${Stage}"
       Handler: app.handler            # REAL handler (replaces mock_handler.handler)
       CodeUri: ../../dist/member-profiles.zip
+      # Application Signals ADOT layer (Track B) — attached only when enabled.
+      Layers: !If [ AppSignalsEnabled, [ !Ref AppSignalsLayerArn ], !Ref "AWS::NoValue" ]
       # Raised from global 15s: reindex scans all profiles and bulk-indexes to
       # OpenSearch (similar to identity-access bulk import). All other operations
       # return in milliseconds — the higher timeout is harmless.
@@ -73,8 +81,15 @@ Resources:
       # path (NFR-MP-PERF-4); standard on-demand Lambda scaling suffices.
       Environment:
         Variables:
+          # Application Signals auto-instrumentation (Track B). Both omitted when
+          # disabled so the function starts normally without the ADOT layer.
+          AWS_LAMBDA_EXEC_WRAPPER: !If [ AppSignalsEnabled, "/opt/otel-instrument", !Ref "AWS::NoValue" ]
+          OTEL_SERVICE_NAME: !If [ AppSignalsEnabled, "member-profiles", !Ref "AWS::NoValue" ]
           TABLE_NAME: !Ref TableName
           IDEMPOTENCY_TABLE: !Ref IdempotencyTableName
+          # Trust boundary for extract_claims: X-Claims-* internal headers are
+          # honored ONLY when the request arrives on the private API (apiId match).
+          PRIVATE_API_ID: !Ref PrivateRestApiId
           EVENT_BUS_NAME: !Ref EventBusName
           API_BASE_URL: !Ref ApiBaseUrl
           ENABLE_SEMANTIC_SEARCH: !Ref EnableSemanticSearch
@@ -85,6 +100,8 @@ Resources:
           MEMBER_EXPORT_BUCKET: !Ref UserExportBucketName
           EXPORT_WORKER_FUNCTION: !Sub "member-profiles-export-${Stage}"
       Policies:
+        # Application Signals write access (Track B) — attached only when enabled.
+        - !If [ AppSignalsEnabled, "arn:aws:iam::aws:policy/CloudWatchLambdaApplicationSignalsExecutionRolePolicy", !Ref "AWS::NoValue" ]
         # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
         - !Ref DynamoDbKmsAccessPolicyArn
         - !Ref SqsKmsAccessPolicyArn
@@ -175,6 +192,8 @@ Resources:
       FunctionName: !Sub "member-profiles-indexer-${Stage}"
       Handler: indexer.handler
       CodeUri: ../../dist/member-profiles.zip
+      # Application Signals ADOT layer (Track B) — attached only when enabled.
+      Layers: !If [ AppSignalsEnabled, [ !Ref AppSignalsLayerArn ], !Ref "AWS::NoValue" ]
       Timeout: 60   # override global 15s — indexer writes to OpenSearch which
                     # can take up to 30s on cold start; 60s gives headroom
       VpcConfig:
@@ -183,8 +202,14 @@ Resources:
       ReservedConcurrentExecutions: 5
       Environment:
         Variables:
+          # Application Signals auto-instrumentation (Track B). Both omitted when
+          # disabled so the function starts normally without the ADOT layer.
+          AWS_LAMBDA_EXEC_WRAPPER: !If [ AppSignalsEnabled, "/opt/otel-instrument", !Ref "AWS::NoValue" ]
+          OTEL_SERVICE_NAME: !If [ AppSignalsEnabled, "member-profiles", !Ref "AWS::NoValue" ]
           OPENSEARCH_ENDPOINT: !Ref OpenSearchEndpoint
       Policies:
+        # Application Signals write access (Track B) — attached only when enabled.
+        - !If [ AppSignalsEnabled, "arn:aws:iam::aws:policy/CloudWatchLambdaApplicationSignalsExecutionRolePolicy", !Ref "AWS::NoValue" ]
         # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
         - !Ref DynamoDbKmsAccessPolicyArn
         - !Ref SqsKmsAccessPolicyArn
@@ -236,6 +261,8 @@ Resources:
       FunctionName: !Sub "member-profiles-export-${Stage}"
       Handler: export_worker.handler
       CodeUri: ../../dist/member-profiles.zip
+      # Application Signals ADOT layer (Track B) — attached only when enabled.
+      Layers: !If [ AppSignalsEnabled, [ !Ref AppSignalsLayerArn ], !Ref "AWS::NoValue" ]
       VpcConfig:
         SubnetIds: !Ref PrivateSubnetIds
         SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
@@ -249,6 +276,10 @@ Resources:
       Timeout: 900
       Environment:
         Variables:
+          # Application Signals auto-instrumentation (Track B). Both omitted when
+          # disabled so the function starts normally without the ADOT layer.
+          AWS_LAMBDA_EXEC_WRAPPER: !If [ AppSignalsEnabled, "/opt/otel-instrument", !Ref "AWS::NoValue" ]
+          OTEL_SERVICE_NAME: !If [ AppSignalsEnabled, "member-profiles", !Ref "AWS::NoValue" ]
           TABLE_NAME: !Ref TableName
           MEMBER_EXPORT_BUCKET: !Ref UserExportBucketName
           OPENSEARCH_ENDPOINT: !Ref OpenSearchEndpoint
@@ -259,6 +290,8 @@ Resources:
       EventInvokeConfig:
         MaximumRetryAttempts: 0
       Policies:
+        # Application Signals write access (Track B) — attached only when enabled.
+        - !If [ AppSignalsEnabled, "arn:aws:iam::aws:policy/CloudWatchLambdaApplicationSignalsExecutionRolePolicy", !Ref "AWS::NoValue" ]
         # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
         - !Ref DynamoDbKmsAccessPolicyArn
         - !Ref SqsKmsAccessPolicyArn

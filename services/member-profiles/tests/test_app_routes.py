@@ -96,6 +96,12 @@ def test_browse_directory(aws, fan_out, events):
                   fan_out=fan_out, events=events)
     ctx.repo.put_profile({"id": "u1", "firstName": "A", "lastName": "B",
                          "role": "Member", "status": "active", "groups": []})
+    # browseDirectory is served only by OpenSearch now (no DynamoDB-scan branch),
+    # so a no-limit GET /members pages OpenSearch with the default size — inject a
+    # stub holding the indexed doc.
+    ctx.repo._os_client = lambda: _FakeOsClient([
+        {"id": "u1", "firstName": "A", "lastName": "B", "role": "Member",
+         "status": "active", "groups": [], "groupIds": [], "firstNameNorm": "a"}])
     resp = dispatch(_event("GET", "/members", claims=_cl_claims(), qs={}), ctx)
     assert resp["statusCode"] == 200
     assert json.loads(resp["body"])["count"] == 1

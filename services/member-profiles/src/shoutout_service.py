@@ -107,7 +107,8 @@ class ShoutoutService:
         self._events = events
         self._fan_out = fan_out
 
-    def _weekly_limit(self, role: str, bearer_token: str | None = None) -> int:
+    def _weekly_limit(self, role: str, bearer_token: str | None = None,
+                      claim_headers: dict | None = None) -> int:
         """Fetch configurable limits from settings, fall back to defaults."""
         limits = {
             ROLE_CL: DEFAULT_LEADER_CL_LIMIT,
@@ -116,7 +117,8 @@ class ShoutoutService:
         }
         if self._fan_out:
             try:
-                result = self._fan_out.fan_out({"settings": "/settings"}, bearer_token=bearer_token)
+                result = self._fan_out.fan_out({"settings": "/settings"}, bearer_token=bearer_token,
+                                               claim_headers=claim_headers)
                 s = result.get("settings") or {}
                 if "shoutoutLimitCl" in s:
                     limits[ROLE_CL] = int(s["shoutoutLimitCl"])
@@ -130,7 +132,8 @@ class ShoutoutService:
 
     # ---- Send (US-13.1/13.2/13.3) ----
 
-    def send(self, body: dict, *, principal, bearer_token: str | None = None) -> dict:
+    def send(self, body: dict, *, principal, bearer_token: str | None = None,
+             claim_headers: dict | None = None) -> dict:
         """Send a shoutout. CL: any member. UGL: own group members. Member: any other member."""
         if not sender_may_shout(principal.role):
             raise ForbiddenError()
@@ -159,7 +162,7 @@ class ShoutoutService:
 
         # Weekly limit check (US-13.3) — role-based quotas from settings
         is_leader = principal.role in (ROLE_CL, ROLE_UGL)
-        weekly_limit = self._weekly_limit(principal.role, bearer_token)
+        weekly_limit = self._weekly_limit(principal.role, bearer_token, claim_headers)
         week_start = _week_start_iso()
         sent_this_week = self._repo.list_shoutouts_sent_since(principal.user_id, week_start)
         if len(sent_this_week) >= weekly_limit:
@@ -186,7 +189,8 @@ class ShoutoutService:
         if recipient_group_id and self._fan_out:
             try:
                 result = self._fan_out.fan_out(
-                    {"group": f"/groups/{recipient_group_id}"}, bearer_token=bearer_token)
+                    {"group": f"/groups/{recipient_group_id}"}, bearer_token=bearer_token,
+                    claim_headers=claim_headers)
                 g = result.get("group") or {}
                 recipient_group_name = g.get("name") or ""
             except Exception as exc:  # noqa: BLE001
@@ -295,11 +299,12 @@ class ShoutoutService:
 
     # ---- Quota info (for the modal display) ----
 
-    def my_quota(self, *, principal, bearer_token: str | None = None) -> dict:
+    def my_quota(self, *, principal, bearer_token: str | None = None,
+                 claim_headers: dict | None = None) -> dict:
         """How many shoutouts the user has remaining this week."""
         if principal.role not in (ROLE_CL, ROLE_UGL, ROLE_MEMBER):
             return {"remaining": 0, "limit": 0}
-        weekly_limit = self._weekly_limit(principal.role, bearer_token)
+        weekly_limit = self._weekly_limit(principal.role, bearer_token, claim_headers)
         week_start = _week_start_iso()
         sent = self._repo.list_shoutouts_sent_since(principal.user_id, week_start)
         return {"remaining": max(0, weekly_limit - len(sent)), "limit": weekly_limit,

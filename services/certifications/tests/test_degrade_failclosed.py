@@ -6,15 +6,33 @@ concurrent-sweep exactly-once (mark-before-emit).
 """
 from __future__ import annotations
 
-from conftest import call, make_definition, submit_claim
+from conftest import FakePrincipal, call, make_definition, submit_claim
 
 
-def test_identity_down_fails_submission_closed_503(ctx, cl, member, aws):
+def test_member_submission_is_identity_independent(ctx, cl, member, aws):
+    """Fresh-claims-at-the-edge: a member's group membership rides in the
+    authorizer-injected claims (principal.member_group_ids), so submission no
+    longer makes a live Identity call and succeeds even if Identity is down.
+    Fail-closed on membership now lives at the edge authorizer (missing CLAIMS
+    item -> Deny), not on this hot path."""
     make_definition(ctx, cl)
     ctx.fake_identity.unreachable = True
     definition_id = ctx.definitions.catalog(principal=member)["items"][0]["id"]
-    status, body = call(ctx, "POST", "/certifications/claims", principal=member,
-                        body={"certId": definition_id, "creditedGroupId": "g-serverless",
+    status, _ = call(ctx, "POST", "/certifications/claims", principal=member,
+                     body={"certId": definition_id, "creditedGroupId": "g-serverless",
+                           "evidenceUrl": "https://e.test/x", "dateEarned": "2026-06-01"})
+    assert status == 201
+
+
+def test_ugl_led_fallback_fails_submission_closed_503(ctx, cl, aws):
+    """The one remaining live Identity dependency on the submit path is the UGL
+    led-group fallback (JWT led absent). It stays fail-closed: Identity down and
+    no JWT led -> 503, never a guessed credit group (NFR-CT-REL-1)."""
+    definition = make_definition(ctx, cl)
+    ctx.fake_identity.unreachable = True
+    ugl_no_led = FakePrincipal("u-ugl", "UserGroupLeader", led_group_id=None)
+    status, body = call(ctx, "POST", "/certifications/claims", principal=ugl_no_led,
+                        body={"certId": definition["id"], "creditedGroupId": "g-serverless",
                               "evidenceUrl": "https://e.test/x", "dateEarned": "2026-06-01"})
     assert status == 503
     assert body["code"] == "DEPENDENCY_UNAVAILABLE"

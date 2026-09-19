@@ -20,11 +20,8 @@ if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
-# https, not http: MembershipClient rejects any other scheme at construction
-# (membership_client.py), and Context() builds a real one when the fixture does
-# not inject a fake. With http here, 61 of the 93 tests in this suite errored at
-# fixture setup rather than running — the suite looked like it had far less
-# coverage than it does.
+# https, not http: MentionClient rejects any other scheme at construction, and
+# Context() builds a real one when the fixture does not inject a fake.
 os.environ.setdefault("API_BASE_URL", "https://localhost:3000")
 os.environ.setdefault("MENTION_TIMEOUT_MS", "1500")
 os.environ.setdefault("SWEEP_TIME_CAP_SECONDS", "600")
@@ -114,12 +111,12 @@ class FakeMentionClient:
         self.valid_ids: list[str] = []
         self.should_fail: bool = False
 
-    def suggest(self, q, group_id, bearer_token=None):
+    def suggest(self, q, group_id, bearer_token=None, claim_headers=None):
         if self.should_fail:
             return []
         return [c for c in self.candidates if q.lower() in c.get("displayName", "").lower()]
 
-    def validate_mentions(self, user_ids, group_id, bearer_token=None):
+    def validate_mentions(self, user_ids, group_id, bearer_token=None, claim_headers=None):
         if self.should_fail:
             return []
         return [uid for uid in user_ids if uid in self.valid_ids]

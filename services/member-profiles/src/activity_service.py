@@ -18,7 +18,7 @@ class ActivityService:
 
     def get_activity(self, member_id: str, *, principal_role: str, principal_led_group_id: str | None,
                       date_from: str | None = None, date_to: str | None = None,
-                      bearer_token: str | None = None) -> dict:
+                      bearer_token: str | None = None, claim_headers: dict | None = None) -> dict:
         if principal_role in ("Administrator", "Member"):
             raise ForbiddenError()  # BR-4 (Admin), BR-13 (Member — self-view not offered here)
 
@@ -42,7 +42,7 @@ class ActivityService:
             "forums": f"/forums/posts?authorId={member_id}{qs}",
             "contributions": f"/contributions/me?memberId={member_id}{qs}",
             "certifications": f"/certifications/claims?memberId={member_id}{qs}",
-        }, bearer_token=bearer_token)
+        }, bearer_token=bearer_token, claim_headers=claim_headers)
 
         events = (results.get("events") or {}).get("items", [])
         forums = (results.get("forums") or {}).get("items", [])

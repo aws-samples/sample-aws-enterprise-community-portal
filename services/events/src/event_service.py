@@ -155,7 +155,7 @@ class EventService:
     # ----------------------------------------------------------------- create
 
     def create(self, body: dict, *, principal, correlation_id: str | None = None,
-               bearer_token: str | None = None) -> dict:
+               bearer_token: str | None = None, claim_headers: dict | None = None) -> dict:
         group_id = body.get("groupId") or None
         self._require_creator_role(principal, group_id)
         fields = self._validate_input(body, require_start=True)
@@ -172,7 +172,8 @@ class EventService:
         self._repo.register_scope(group_id)
 
         counts = self._designations.set_from_input(event, body, principal=principal,
-                                                   bearer_token=bearer_token)
+                                                   bearer_token=bearer_token,
+                                                   claim_headers=claim_headers)
         if counts:
             event.update(counts)  # response must match the stored row's counts
 
@@ -189,14 +190,16 @@ class EventService:
 
     # ------------------------------------------------------------------- read
 
-    def get(self, event_id: str, *, principal, bearer_token: str | None = None) -> dict:
+    def get(self, event_id: str, *, principal, bearer_token: str | None = None,
+            claim_headers: dict | None = None) -> dict:
         event = self._load_viewable(event_id, principal)
-        points = self._contrib.points_for(event["type"], bearer_token=bearer_token)
+        points = self._contrib.points_for(event["type"], bearer_token=bearer_token,
+                                          claim_headers=claim_headers)
         my_rsvp = self._repo.get_rsvp(event_id, principal.user_id) or {}
         return event_public(event, principal=principal, points=points, my_rsvp=my_rsvp)
 
     def list(self, *, principal, filters: dict, limit: int, cursor: str | None,
-             bearer_token: str | None = None) -> dict:
+             bearer_token: str | None = None, claim_headers: dict | None = None) -> dict:
         if principal.role == "Administrator":
             # Administrators have no event permissions at all — not even read
             # (BR-A1). The permission matrix has zero event entries for them.
@@ -235,7 +238,7 @@ class EventService:
             event_type = row.get("type")
             if event_type not in points_by_type:
                 points_by_type[event_type] = self._contrib.points_for(
-                    event_type, bearer_token=bearer_token)
+                    event_type, bearer_token=bearer_token, claim_headers=claim_headers)
         # Per-caller RSVP state for the whole page in ONE query (same pattern as
         # the cached points read): without it the member-facing card cannot tell
         # it already RSVP'd, so it keeps offering the RSVP button and a member can
@@ -397,7 +400,8 @@ class EventService:
             return True
         return predicate
 
-    def calendar(self, *, principal, filters: dict, bearer_token: str | None = None) -> dict:
+    def calendar(self, *, principal, filters: dict, bearer_token: str | None = None,
+                 claim_headers: dict | None = None) -> dict:
         """Calendar is the same scoped query with a date window and no paging —
         a month never exceeds a page (BR-S5).
 
@@ -415,7 +419,7 @@ class EventService:
             cal_filters["from"] = widened.isoformat()
 
         result = self.list(principal=principal, filters=cal_filters, limit=200,
-                           cursor=None, bearer_token=bearer_token)
+                           cursor=None, bearer_token=bearer_token, claim_headers=claim_headers)
         if window_from or window_to:
             result["items"] = [e for e in result["items"]
                                if _overlaps_window(e, window_from, window_to)]
@@ -459,16 +463,18 @@ class EventService:
         }, correlation_id=correlation_id)
 
     def complete(self, event_id: str, *, principal, correlation_id: str | None = None,
-                 bearer_token: str | None = None) -> dict:
+                 bearer_token: str | None = None, claim_headers: dict | None = None) -> dict:
         event = self._load_manageable(event_id, principal)
         # US-2.19: the creator may manually mark an event Completed WITHOUT
         # recording attendance (BR-L2 only requires the date to have passed).
         # complete_internal enforces the past-date rule + the legal transition.
         return self.complete_internal(event, correlation_id=correlation_id,
-                                      bearer_token=bearer_token, principal=principal)
+                                      bearer_token=bearer_token, principal=principal,
+                                      claim_headers=claim_headers)
 
     def complete_internal(self, event: dict, *, correlation_id: str | None = None,
-                          bearer_token: str | None = None, principal=None) -> dict:
+                          bearer_token: str | None = None, principal=None,
+                          claim_headers: dict | None = None) -> dict:
         """Shared by manual completion and the automatic transition that any
         applied attendance triggers (BR-L3)."""
         self._transition(event, STATUS_COMPLETED)
@@ -496,7 +502,8 @@ class EventService:
             self._library.promote_event_materials(event)
 
         self._designations.award_on_completion(
-            event, correlation_id=correlation_id, bearer_token=bearer_token)
+            event, correlation_id=correlation_id, bearer_token=bearer_token,
+            claim_headers=claim_headers)
         self._events.publish("EventCompleted", {
             "eventId": event["id"], "title": event.get("title"),
             "groupId": event.get("groupId"), "type": event.get("type"),

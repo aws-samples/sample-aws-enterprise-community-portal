@@ -65,12 +65,12 @@ class FakeDirectory:
         self.groups: dict[str, str] = {}
         self.failing: set[str] = set()
 
-    def member_name(self, member_id, *, bearer_token=None):
+    def member_name(self, member_id, *, bearer_token=None, claim_headers=None):
         if member_id in self.failing:
             return None
         return self.names.get(member_id)
 
-    def group_name(self, group_id, *, bearer_token=None):
+    def group_name(self, group_id, *, bearer_token=None, claim_headers=None):
         if group_id in self.failing:
             return None
         return self.groups.get(group_id)

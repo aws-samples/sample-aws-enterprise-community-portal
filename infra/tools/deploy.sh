@@ -45,7 +45,18 @@ OPS_EMAIL=${OPS_EMAIL:-admin@example.com}
 # Check before deploying:
 #   aws lambda invoke --function-name settings-dev ... GET /settings
 #   -> .allowedEmailDomains  must equal this list
-ALLOWED_DOMAINS=${ALLOWED_DOMAINS:-amazon.com,cognizant.com}
+ALLOWED_DOMAINS=${ALLOWED_DOMAINS:-example.com}
+
+# Observability gating (both default OFF). Set to true to deploy dashboards /
+# Application Signals. When ENABLE_APP_SIGNALS=true you MUST also supply
+# APP_SIGNALS_LAYER_ARN (region+runtime-specific ADOT layer), or the instrumented
+# functions will fail to start (missing /opt/otel-instrument wrapper).
+ENABLE_DASHBOARDS=${ENABLE_DASHBOARDS:-false}
+ENABLE_APP_SIGNALS=${ENABLE_APP_SIGNALS:-false}
+# Non-empty placeholder so `sam deploy --parameter-overrides` accepts it (empty
+# values are rejected). Inert while ENABLE_APP_SIGNALS=false; override with the
+# real region/runtime ADOT layer ARN when enabling Application Signals.
+APP_SIGNALS_LAYER_ARN=${APP_SIGNALS_LAYER_ARN:-arn:aws:lambda:us-east-1:000000000000:layer:SET_APP_SIGNALS_LAYER_ARN:1}
 
 echo "account=$ACCOUNT region=$REGION stack=$STACK bucket=$BUCKET prefix=$PREFIX"
 
@@ -178,6 +189,9 @@ sam deploy -t infra/root-template.yaml \
     "OpsEmail=$OPS_EMAIL" \
     "AllowedEmailDomains=$ALLOWED_DOMAINS" \
     "EnableSemanticSearch=false" \
+    "EnableObservabilityDashboards=$ENABLE_DASHBOARDS" \
+    "EnableApplicationSignals=$ENABLE_APP_SIGNALS" \
+    "AppSignalsLayerArn=$APP_SIGNALS_LAYER_ARN" \
     "TemplateBaseUrl=https://$BUCKET.s3.$REGION.amazonaws.com/$PREFIX" \
     "DeployNonce=$(date +%s)"
 

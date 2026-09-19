@@ -66,7 +66,8 @@ class DesignationService:
     # ------------------------------------------------------------------ writes
 
     def set_from_input(self, event: dict, body: dict, *, principal,
-                       bearer_token: str | None = None) -> dict | None:
+                       bearer_token: str | None = None,
+                       claim_headers: dict | None = None) -> dict | None:
         """Designations supplied inline on create. Returns the resulting counts
         so the caller can refresh its in-memory event dict — the counts are
         written to the STORED row by `set_designation_counts`, and without this
@@ -79,10 +80,10 @@ class DesignationService:
             return None
         return self._replace(event, presenters=presenters, organizers=organizers,
                              externals=externals, principal=principal,
-                             bearer_token=bearer_token)
+                             bearer_token=bearer_token, claim_headers=claim_headers)
 
     def set(self, event_id: str, body: dict, *, principal,
-            bearer_token: str | None = None) -> dict:
+            bearer_token: str | None = None, claim_headers: dict | None = None) -> dict:
         event = self._repo.get_event(event_id)
         if event is None or not can_view(event, principal):
             raise NotFoundError(message="Event not found.")
@@ -97,8 +98,10 @@ class DesignationService:
         self._replace(event, presenters=body.get("presenters") or [],
                       organizers=body.get("organizers") or [],
                       externals=body.get("externalPresenters") or [],
-                      principal=principal, bearer_token=bearer_token)
-        return self.list_for(event_id, principal=principal)
+                      principal=principal, bearer_token=bearer_token,
+                      claim_headers=claim_headers)
+        return self.list_for(event_id, principal=principal,
+                             bearer_token=bearer_token, claim_headers=claim_headers)
 
     @staticmethod
     def _validate_ids(user_ids: list, kind: str) -> list[str]:
@@ -130,11 +133,13 @@ class DesignationService:
                 out.append(name)
         return out
 
-    def _resolve(self, user_id: str, *, bearer_token: str | None) -> dict:
+    def _resolve(self, user_id: str, *, bearer_token: str | None,
+                 claim_headers: dict | None = None) -> dict:
         """Role + display name for a portal designee. FAIL-CLOSED for points."""
         if user_id in self._resolve_cache:
             return self._resolve_cache[user_id]
-        looked_up = self._directory.lookup(user_id, bearer_token=bearer_token) \
+        looked_up = self._directory.lookup(user_id, bearer_token=bearer_token,
+                                           claim_headers=claim_headers) \
             if self._directory else None
         if looked_up is None:
             info = {"role": None, "displayName": user_id,
@@ -150,7 +155,8 @@ class DesignationService:
         return info
 
     def _replace(self, event: dict, *, presenters: list, organizers: list,
-                 externals: list, principal, bearer_token: str | None = None) -> dict:
+                 externals: list, principal, bearer_token: str | None = None,
+                 claim_headers: dict | None = None) -> dict:
         presenters = self._validate_ids(presenters, PRESENTER)
         organizers = self._validate_ids(organizers, ORGANIZER)
         externals = self._validate_external_names(externals)
@@ -158,7 +164,8 @@ class DesignationService:
         for kind, user_ids in ((PRESENTER, presenters), (ORGANIZER, organizers)):
             self._repo.clear_designations(event["id"], kind)
             for user_id in user_ids:
-                info = self._resolve(user_id, bearer_token=bearer_token)
+                info = self._resolve(user_id, bearer_token=bearer_token,
+                                     claim_headers=claim_headers)
                 self._repo.put_designation({
                     "eventId": event["id"], "userId": user_id, "kind": kind,
                     "displayName": info["displayName"], "external": False,
@@ -190,17 +197,18 @@ class DesignationService:
     # ------------------------------------------------------------------- reads
 
     def list_for(self, event_id: str, *, principal,
-                 bearer_token: str | None = None) -> dict:
+                 bearer_token: str | None = None, claim_headers: dict | None = None) -> dict:
         event = self._repo.get_event(event_id)
         if event is None or not can_view(event, principal):
             raise NotFoundError(message="Event not found.")
         rows = self._repo.list_designations(event_id)
         if self._directory and bearer_token:
-            rows = self._refresh_unresolved(event_id, rows, bearer_token=bearer_token)
+            rows = self._refresh_unresolved(event_id, rows, bearer_token=bearer_token,
+                                            claim_headers=claim_headers)
         return listing(rows, designation_public)
 
     def _refresh_unresolved(self, event_id: str, rows: list[dict], *,
-                            bearer_token: str) -> list[dict]:
+                            bearer_token: str, claim_headers: dict | None = None) -> list[dict]:
         """Re-resolve portal designees whose displayName is still their userId.
 
         This happens when the original designation write failed the directory
@@ -217,7 +225,7 @@ class DesignationService:
             if (not row.get("external")
                     and row.get("displayName") == row.get("userId")):
                 looked_up = self._directory.lookup(
-                    row["userId"], bearer_token=bearer_token)
+                    row["userId"], bearer_token=bearer_token, claim_headers=claim_headers)
                 if looked_up and looked_up.get("displayName") != row["userId"]:
                     # Got a real name — patch the stored row and return the
                     # updated copy so the response reflects the fix immediately.
@@ -245,7 +253,8 @@ class DesignationService:
     # ------------------------------------------------------------------ awards
 
     def award_on_completion(self, event: dict, *, correlation_id: str | None = None,
-                            bearer_token: str | None = None) -> int:
+                            bearer_token: str | None = None,
+                            claim_headers: dict | None = None) -> int:
         """Publish delivery/organize awards when an event completes (BR-P4).
 
         Called from BOTH completion routes — manual completion and the automatic
@@ -256,7 +265,8 @@ class DesignationService:
         double-award (BR-P6). External designees never appear here: they are
         stored with pointsEligible=False by construction.
         """
-        points = self._contrib.points_for(event.get("type"), bearer_token=bearer_token)
+        points = self._contrib.points_for(event.get("type"), bearer_token=bearer_token,
+                                          claim_headers=claim_headers)
         delivery_points = points.get("delivery")
         batch: list[tuple[str, dict]] = []
         awarded = 0

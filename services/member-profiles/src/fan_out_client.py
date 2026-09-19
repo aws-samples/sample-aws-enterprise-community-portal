@@ -77,9 +77,15 @@ class FanOutClient:
         self.timeout = timeout
         self._opener = opener or urlrequest.urlopen
 
-    def _get(self, service: str, path: str, *, bearer_token: str | None) -> dict | None:
+    def _get(self, service: str, path: str, *, bearer_token: str | None,
+             claim_headers: dict | None = None) -> dict | None:
         """A single GET call, individually fault-isolated. Returns None on ANY
-        failure (timeout, HTTP error, connection error, bad JSON) — never raises."""
+        failure (timeout, HTTP error, connection error, bad JSON) — never raises.
+
+        `claim_headers` (X-Claims-*) propagate the CALLER's fresh claims to the
+        private API so the downstream builds its principal from them (the private
+        API has no authorizer). Sent alongside the JWT during rollout; the JWT is
+        dropped once the private authorizer is removed."""
         if _short_circuited(service):
             return None
         if not self.base_url or not self.base_url.startswith("https://"):
@@ -90,6 +96,8 @@ class FanOutClient:
         req = urlrequest.Request(f"{self.base_url}{path}", method="GET")  # noqa: S310 — scheme validated above
         if bearer_token:
             req.add_header("Authorization", f"Bearer {bearer_token}")
+        for hk, hv in (claim_headers or {}).items():
+            req.add_header(hk, hv)
         try:
             with self._opener(req, timeout=self.timeout) as resp:  # noqa: S310 — scheme validated above
                 body = resp.read()
@@ -101,15 +109,18 @@ class FanOutClient:
                 service=service, path=path, error=str(err))
             return None
 
-    def fan_out(self, calls: dict[str, str], *, bearer_token: str | None = None) -> dict[str, dict | None]:
+    def fan_out(self, calls: dict[str, str], *, bearer_token: str | None = None,
+                claim_headers: dict | None = None) -> dict[str, dict | None]:
         """`calls` = {service_name: path}. Issues all calls in parallel; returns
         {service_name: response_or_None}. Bounded total latency = slowest single
-        call, not the sum (NFR-MP-PERF-2)."""
+        call, not the sum (NFR-MP-PERF-2). `claim_headers` forward the caller's
+        fresh claims to each internal call (see _get)."""
         if not calls:
             return {}
         with ThreadPoolExecutor(max_workers=len(calls)) as pool:
             futures = {
-                svc: pool.submit(self._get, svc, path, bearer_token=bearer_token)
+                svc: pool.submit(self._get, svc, path, bearer_token=bearer_token,
+                                 claim_headers=claim_headers)
                 for svc, path in calls.items()
             }
             return {svc: f.result() for svc, f in futures.items()}
