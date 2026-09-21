@@ -9,4 +9,12 @@
 # boto3 is intentionally NOT pinned here — the Lambda runtime provides it, and
 # this authorizer runs on every request, so the package is kept minimal to bound
 # cold-start (design §3).
-python-jose==3.3.0
+#
+# 3.4.0 (from 3.3.0) fixes two CVEs in this auth-critical dependency:
+#   CVE-2024-33663 (CRITICAL) — algorithm confusion with OpenSSH ECDSA keys
+#   CVE-2024-33664 (moderate) — JWE compressed-content denial of service
+# Still the BASE install (no [cryptography] extra) so the pure-Python
+# rsa/ecdsa/pyasn1 backend is preserved for cross-platform vendoring — see above.
+# The verifier already pins algorithms=["RS256"] against Cognito RSA JWKS, which
+# blocks the confusion vector in practice; this bump is the defence-in-depth fix.
+python-jose==3.4.0
